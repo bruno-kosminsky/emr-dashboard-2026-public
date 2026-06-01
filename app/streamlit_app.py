@@ -27,6 +27,40 @@ SNAPSHOTS_B2B_DIR = SNAPSHOTS / "b2b"
 
 st.set_page_config(page_title="Dashboard EMR · R1 2026", layout="wide", initial_sidebar_state="collapsed")
 
+
+def _require_password() -> None:
+    """Gate de senha única compartilhada. A senha (hash bcrypt) vive em
+    st.secrets["APP_PASSWORD_HASH"] no Streamlit Cloud — nunca no repositório.
+    Se o secret não existir (ex.: rodando local sem secrets), o app libera o
+    acesso para não bloquear o desenvolvimento."""
+    try:
+        pw_hash = st.secrets.get("APP_PASSWORD_HASH")
+    except Exception:
+        pw_hash = None
+    if not pw_hash:
+        return  # sem senha configurada → acesso liberado (dev/local)
+    if st.session_state.get("_authed"):
+        return
+    import bcrypt
+    st.markdown("#### Dashboard EMR · R1 2026")
+    with st.form("login"):
+        senha = st.text_input("Senha de acesso", type="password")
+        entrar = st.form_submit_button("Entrar")
+    if entrar:
+        try:
+            ok = bcrypt.checkpw(senha.encode(), pw_hash.encode() if isinstance(pw_hash, str) else pw_hash)
+        except Exception:
+            ok = False
+        if ok:
+            st.session_state["_authed"] = True
+            st.rerun()
+        else:
+            st.error("Senha incorreta.")
+    st.stop()
+
+
+_require_password()
+
 st.markdown(
     """
     <style>
