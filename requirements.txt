@@ -1,0 +1,8 @@
+psycopg2-binary>=2.9
+pandas>=2.0
+python-dotenv>=1.0
+pyarrow>=14
+streamlit>=1.40
+plotly>=5.20
+bcrypt>=4.0
+pyyaml>=6.0
