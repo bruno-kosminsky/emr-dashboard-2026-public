@@ -277,10 +277,24 @@ PRESCRIPTION_MEANING = {
 # ============================================================
 
 @st.cache_data(ttl=60 * 60)
+def _normalize_canonico(d: pd.DataFrame) -> pd.DataFrame:
+    """Compat de esquema: o ETL B2C renomeou as colunas de acerto canônico para
+    'm10_*'; o B2B e o app usam 'acerto_canonico_*'. Renomeia m10_* → canônico
+    para o app funcionar com qualquer um dos dois esquemas."""
+    ren = {
+        "m10_acertos": "acerto_canonico_acertos",
+        "m10_questao_count": "acerto_canonico_questao_count",
+        "m10_acertos_7d": "acerto_canonico_acertos_7d",
+        "m10_questao_count_7d": "acerto_canonico_questao_count_7d",
+    }
+    cols = {k: v for k, v in ren.items() if k in d.columns and v not in d.columns}
+    return d.rename(columns=cols) if cols else d
+
+
 def load_snapshot(snap_dir: Path = SNAPSHOTS):
-    df = pd.read_parquet(snap_dir / "latest.parquet")
+    df = _normalize_canonico(pd.read_parquet(snap_dir / "latest.parquet"))
     cohort = pd.read_parquet(snap_dir / "latest_cohort.parquet")
-    metrics = pd.read_parquet(snap_dir / "latest_cohort_metrics.parquet")
+    metrics = _normalize_canonico(pd.read_parquet(snap_dir / "latest_cohort_metrics.parquet"))
     df["semana_iso"] = pd.to_datetime(df["semana_iso"])
     for d in (df, cohort, metrics):
         d["account_id"] = d["account_id"].astype(int)
