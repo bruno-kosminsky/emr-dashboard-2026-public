@@ -7,35 +7,23 @@ Foco: responder em 30s "onde a turma está hoje e pra onde está indo".
 
 from __future__ import annotations
 
-import os
 from datetime import date
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import psycopg2
-from dotenv import load_dotenv
 from plotly.subplots import make_subplots
 import streamlit as st
 
-# Carrega .env do diretório do dashboard (mesma origem do ETL).
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+# App público: NÃO conecta no Aurora em runtime. Toda fonte (snapshots semanais,
+# resultados ENAMED, avaliações da aba Qualidade) é lida de parquets anonimizados
+# gerados 1x/dia pelo ETL (etl/gen_public_snapshots.py no repo privado). Sem
+# credenciais, sem segredos, sem psycopg2 — o app nunca quebra por banco fora do ar.
 
 ROOT = Path(__file__).resolve().parent.parent
 SNAPSHOTS = ROOT / "snapshots"
-
-# Ponte st.secrets → os.environ: no Streamlit Cloud não há arquivo .env, as
-# credenciais do Aurora vivem em st.secrets. Sem isso, os.getenv(...) volta None
-# em produção e todas as queries diretas ao Aurora falham. Local (com .env) tem
-# prioridade; o secret só preenche chaves ainda ausentes.
-try:
-    for _k in ("EMR_AURORA_HOST", "EMR_AURORA_PORT", "EMR_AURORA_USER", "EMR_AURORA_PASSWORD"):
-        if not os.getenv(_k) and _k in st.secrets:
-            os.environ[_k] = str(st.secrets[_k])
-except Exception:
-    # st.secrets ausente/sem arquivo de secrets → segue com .env/os.environ.
-    pass
+SNAPSHOTS_B2B_DIR = SNAPSHOTS / "b2b"
 
 st.set_page_config(page_title="Dashboard EMR · R1 2026", layout="wide", initial_sidebar_state="collapsed")
 
@@ -335,199 +323,45 @@ BIG_AREAS_NOMES = {1: "Cirurgia", 2: "Clínica Médica", 3: "Pediatria",
                    4: "Ginecologia/Obstetrícia", 5: "Med. Preventiva"}
 
 
-def _aurora_conn(database: str):
-    return psycopg2.connect(
-        host=os.getenv("EMR_AURORA_HOST"),
-        port=os.getenv("EMR_AURORA_PORT"),
-        user=os.getenv("EMR_AURORA_USER"),
-        password=os.getenv("EMR_AURORA_PASSWORD"),
-        dbname=database,
-        connect_timeout=15,
-    )
+# --- Leitura de parquets pré-calculados (gerados 1x/dia por gen_public_snapshots.py).
+# Os parquets já vêm com big_area_id resolvido e SEM PII (só account_id + métricas).
+@st.cache_data(ttl=60 * 60)
+def _read_b2b_parquet(name: str) -> pd.DataFrame:
+    """Lê um parquet de snapshots/b2b/. DataFrame vazio se não existir."""
+    p = SNAPSHOTS_B2B_DIR / name
+    if not p.exists():
+        return pd.DataFrame()
+    return pd.read_parquet(p)
 
 
-@st.cache_data(ttl=60 * 60 * 24)
-def load_specialty_to_big_area() -> dict[int, int]:
-    """Mapa specialty_id → big_area_id (só big_areas 1-5 visíveis)."""
-    with _aurora_conn("support") as c:
-        with c.cursor() as cur:
-            cur.execute(
-                "SELECT id, big_area_id FROM public.specialties "
-                "WHERE big_area_id IN (1,2,3,4,5)"
-            )
-            return {sid: bid for sid, bid in cur.fetchall()}
-
-
-def _fetch_ratings(database: str, sql: str, account_ids: list[int]) -> pd.DataFrame:
-    with _aurora_conn(database) as c:
-        with c.cursor() as cur:
-            cur.execute(sql, (account_ids,))
-            rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-    return pd.DataFrame(rows, columns=cols)
+def _filter_by_accounts(df: pd.DataFrame, account_ids: tuple[int, ...]) -> pd.DataFrame:
+    if df.empty or "account_id" not in df.columns:
+        return df
+    return df[df["account_id"].isin(set(account_ids))].copy()
 
 
 @st.cache_data(ttl=60 * 60, show_spinner="Carregando avaliações de aulas…")
 def load_avaliacoes_aulas(account_ids: tuple[int, ...]) -> pd.DataFrame:
-    """Avaliações de aulas (streaming.lessons_ratings) com big_area derivada.
-
-    Big_area da aula = first big_area_id encontrado nas specialties da aula
-    (lesson_specialties). Aulas sem mapeamento ficam de fora.
-    """
-    ids = list(account_ids)
-    # 1) ratings + lesson_id
-    rates = _fetch_ratings(
-        "streaming",
-        """
-        SELECT
-            DATE_TRUNC('month', created_at)::date AS mes,
-            lesson_id,
-            rate,
-            account_id
-        FROM public.lessons_ratings
-        WHERE account_id = ANY(%s)
-          AND created_at >= '2026-01-01'
-          AND created_at <  CURRENT_DATE + INTERVAL '1 day'
-        """,
-        ids,
-    )
-    if rates.empty:
-        return rates.assign(big_area_id=pd.Series(dtype=int))
-    # 2) lesson_id → specialty_id (todas as aulas avaliadas)
-    lesson_ids = rates["lesson_id"].unique().tolist()
-    ls = _fetch_ratings(
-        "streaming",
-        "SELECT lesson_id, specialty_id FROM public.lesson_specialties WHERE lesson_id = ANY(%s)",
-        lesson_ids,
-    )
-    # 3) specialty → big_area (do support)
-    spec_to_big = load_specialty_to_big_area()
-    ls["big_area_id"] = ls["specialty_id"].map(spec_to_big)
-    ls = ls.dropna(subset=["big_area_id"])
-    # 4) primeira big_area por lesson
-    lesson_big = (
-        ls.sort_values(["lesson_id", "big_area_id"])
-          .drop_duplicates("lesson_id", keep="first")
-          [["lesson_id", "big_area_id"]]
-    )
-    lesson_big["big_area_id"] = lesson_big["big_area_id"].astype(int)
-    out = rates.merge(lesson_big, on="lesson_id", how="inner")
-    return out[["mes", "big_area_id", "rate", "account_id"]]
+    """Avaliações de aulas (mes, big_area_id, rate, account_id) do parquet."""
+    return _filter_by_accounts(_read_b2b_parquet("avaliacoes_aulas.parquet"), account_ids)
 
 
 @st.cache_data(ttl=60 * 60, show_spinner="Carregando avaliações de questões…")
 def load_avaliacoes_questoes(account_ids: tuple[int, ...]) -> pd.DataFrame:
-    """Avaliações de comentários de questões com big_area derivada."""
-    ids = list(account_ids)
-    rates = _fetch_ratings(
-        "assessment",
-        """
-        SELECT
-            DATE_TRUNC('month', created_at)::date AS mes,
-            question_id,
-            rating AS rate,
-            account_id
-        FROM public.question_comment_ratings
-        WHERE account_id = ANY(%s)
-          AND created_at >= '2026-01-01'
-          AND created_at <  CURRENT_DATE + INTERVAL '1 day'
-        """,
-        ids,
-    )
-    if rates.empty:
-        return rates.assign(big_area_id=pd.Series(dtype=int))
-    q_ids = rates["question_id"].unique().tolist()
-    qs = _fetch_ratings(
-        "assessment",
-        "SELECT question_id, specialty_id FROM public.question_specialties WHERE question_id = ANY(%s)",
-        q_ids,
-    )
-    spec_to_big = load_specialty_to_big_area()
-    qs["big_area_id"] = qs["specialty_id"].map(spec_to_big)
-    qs = qs.dropna(subset=["big_area_id"])
-    q_big = (
-        qs.sort_values(["question_id", "big_area_id"])
-          .drop_duplicates("question_id", keep="first")
-          [["question_id", "big_area_id"]]
-    )
-    q_big["big_area_id"] = q_big["big_area_id"].astype(int)
-    out = rates.merge(q_big, on="question_id", how="inner")
-    return out[["mes", "big_area_id", "rate", "account_id"]]
+    """Avaliações de comentários de questões do parquet."""
+    return _filter_by_accounts(_read_b2b_parquet("avaliacoes_questoes.parquet"), account_ids)
 
 
 @st.cache_data(ttl=60 * 60, show_spinner="Carregando avaliações de materiais…")
 def load_avaliacoes_materiais(account_ids: tuple[int, ...]) -> pd.DataFrame:
-    """Avaliações de materiais (ebook/resumo/mapa mental/suporte) com big_area
-    derivada via lesson_id → lesson_specialties → big_area.
-
-    Tipos retornados (coluna `tipo_material`):
-      EBOOK · SUMMARY · MIND_MAP · SUPPORTING_MATERIAL.
-    """
-    ids = list(account_ids)
-    rates = _fetch_ratings(
-        "streaming",
-        """
-        SELECT
-            DATE_TRUNC('month', lfr.created_at)::date AS mes,
-            lf.lesson_id,
-            lf.type::text AS tipo_material,
-            lfr.rate,
-            lfr.account_id
-        FROM public.lesson_file_rates lfr
-        JOIN public.lesson_files lf ON lf.id = lfr.lesson_file_id
-        WHERE lfr.account_id = ANY(%s)
-          AND lfr.created_at >= '2026-01-01'
-          AND lfr.created_at <  CURRENT_DATE + INTERVAL '1 day'
-        """,
-        ids,
-    )
-    if rates.empty:
-        return rates.assign(big_area_id=pd.Series(dtype=int))
-    lesson_ids = rates["lesson_id"].dropna().unique().tolist()
-    if not lesson_ids:
-        rates["big_area_id"] = pd.NA
-        return rates[["mes", "big_area_id", "rate", "account_id", "tipo_material"]]
-    ls = _fetch_ratings(
-        "streaming",
-        "SELECT lesson_id, specialty_id FROM public.lesson_specialties WHERE lesson_id = ANY(%s)",
-        lesson_ids,
-    )
-    spec_to_big = load_specialty_to_big_area()
-    ls["big_area_id"] = ls["specialty_id"].map(spec_to_big)
-    ls = ls.dropna(subset=["big_area_id"])
-    lesson_big = (
-        ls.sort_values(["lesson_id", "big_area_id"])
-          .drop_duplicates("lesson_id", keep="first")
-          [["lesson_id", "big_area_id"]]
-    )
-    lesson_big["big_area_id"] = lesson_big["big_area_id"].astype(int)
-    out = rates.merge(lesson_big, on="lesson_id", how="left")
-    return out[["mes", "big_area_id", "rate", "account_id", "tipo_material"]]
+    """Avaliações de materiais (inclui coluna tipo_material) do parquet."""
+    return _filter_by_accounts(_read_b2b_parquet("avaliacoes_materiais.parquet"), account_ids)
 
 
 @st.cache_data(ttl=60 * 60, show_spinner="Carregando avaliações de flashcards…")
 def load_avaliacoes_flashcards(account_ids: tuple[int, ...]) -> pd.DataFrame:
-    """Avaliações de decks de flashcards. Sem big_area (deck mapeia por
-    subject_id, mas o mapeamento subject→big_area está fora do escopo)."""
-    ids = list(account_ids)
-    rates = _fetch_ratings(
-        "flashcard",
-        """
-        SELECT
-            DATE_TRUNC('month', created_at)::date AS mes,
-            rating AS rate,
-            account_id
-        FROM public.deck_rating
-        WHERE account_id = ANY(%s)
-          AND created_at >= '2026-01-01'
-          AND created_at <  CURRENT_DATE + INTERVAL '1 day'
-        """,
-        ids,
-    )
-    if rates.empty:
-        return rates.assign(big_area_id=pd.Series(dtype=int))
-    rates["big_area_id"] = pd.NA
-    return rates[["mes", "big_area_id", "rate", "account_id"]]
+    """Avaliações de decks de flashcards do parquet."""
+    return _filter_by_accounts(_read_b2b_parquet("avaliacoes_flashcards.parquet"), account_ids)
 
 
 # Simulados ENAMED Inspirali oficiais aplicados em 2026 (sem testes/sandbox).
@@ -546,86 +380,34 @@ ENAMED_2026_TEMPLATES_FALLBACK: list[tuple[int, str, str]] = [
 ENAMED_MIN_ALUNOS = 100
 
 
-@st.cache_data(ttl=60 * 60, show_spinner="Descobrindo simulados ENAMED 2026…")
+@st.cache_data(ttl=60 * 60)
 def load_enamed_2026_templates() -> list[tuple[int, str, str]]:
-    """Descobre no Aurora os simulados ENAMED Inspirali 2026 oficiais.
+    """Lista os simulados ENAMED Inspirali 2026 oficiais a partir do parquet
+    pré-calculado (enamed_templates.parquet), em ordem cronológica.
 
-    Critério: nome casa 'Nº Simulado Enamed - Inspirali 2026', exclui variantes
-    de teste (nome contendo 'teste'), e ≥ ENAMED_MIN_ALUNOS alunos finalizados.
-    Rótulo = nome real do template (com espaços normalizados); ordem cronológica
-    pela 1ª finalização. Em caso de falha/vazio, cai para o fallback hardcoded.
+    O parquet é gerado 1x/dia pelo ETL (descoberta: nome casa
+    'Nº Simulado Enamed - Inspirali 2026', exclui TESTE, ≥100 alunos). Se o
+    parquet faltar, cai para o fallback hardcoded.
 
     Retorna lista de (mock_template_id, nome, data_aplicacao_iso).
     """
-    sql = """
-        SELECT
-            m.mock_template_id,
-            mt.name,
-            MIN(m.finished_at)::date AS data_aplicacao
-        FROM public.mocks m
-        JOIN public.mock_templates mt ON mt.id = m.mock_template_id
-        WHERE m.created_at >= '2026-01-01'
-          AND m.finished_at IS NOT NULL
-          AND m.deleted_at IS NULL
-          AND mt.name ~* '[0-9]+º\\s*Simulado\\s*Enamed\\s*-\\s*Inspirali\\s*2026'
-          AND mt.name !~* 'teste'
-        GROUP BY m.mock_template_id, mt.name
-        HAVING COUNT(DISTINCT m.account_id) >= %s
-        ORDER BY MIN(m.finished_at)
-    """
-    try:
-        with _aurora_conn("assessment") as c:
-            with c.cursor() as cur:
-                cur.execute(sql, (ENAMED_MIN_ALUNOS,))
-                rows = cur.fetchall()
-        templates = [
-            (int(tid), " ".join(str(name).split()), data.isoformat())
-            for tid, name, data in rows
-        ]
-        if templates:
-            return templates
-    except Exception as exc:  # Aurora indisponível → fallback resiliente
-        st.warning(
-            f"Não foi possível descobrir os simulados ENAMED no Aurora "
-            f"({exc}); usando lista de fallback.",
-            icon="⚠️",
-        )
-    return list(ENAMED_2026_TEMPLATES_FALLBACK)
+    df = _read_b2b_parquet("enamed_templates.parquet")
+    if df.empty:
+        return list(ENAMED_2026_TEMPLATES_FALLBACK)
+    return [
+        (int(r.mock_template_id), str(r.nome), str(r.data_aplicacao))
+        for r in df.itertuples()
+    ]
 
 
-@st.cache_data(ttl=60 * 60, show_spinner="Carregando ENAMED 2026 do Aurora…")
+@st.cache_data(ttl=60 * 60)
 def load_enamed_2026_results(account_ids: tuple[int, ...]) -> pd.DataFrame:
-    """Para cada aluno do cohort, retorna acertos + question_count em cada um dos
-    simulados ENAMED 2026 oficiais (descobertos por load_enamed_2026_templates).
+    """Resultados ENAMED 2026 por aluno, do parquet pré-calculado
+    (enamed_results.parquet), filtrados pelos account_ids do grupo.
 
     Colunas: account_id, mock_template_id, question_count, acertos, pct.
     """
-    ids = list(account_ids)
-    template_ids = [tid for tid, _, _ in load_enamed_2026_templates()]
-    sql = """
-        SELECT
-            m.account_id,
-            m.mock_template_id,
-            m.question_count,
-            COUNT(*) FILTER (WHERE alt.is_correct) AS acertos
-        FROM public.mocks m
-        JOIN public.alternative_answers aa ON aa.mock_id = m.id
-        JOIN public.alternatives alt ON alt.id = aa.alternative_id
-        WHERE m.mock_template_id = ANY(%s)
-          AND m.account_id = ANY(%s)
-          AND m.finished_at IS NOT NULL
-          AND m.deleted_at IS NULL
-        GROUP BY m.id, m.account_id, m.mock_template_id, m.question_count
-    """
-    with _aurora_conn("assessment") as c:
-        with c.cursor() as cur:
-            cur.execute(sql, (template_ids, ids))
-            rows = cur.fetchall()
-            cols = [d[0] for d in cur.description]
-    out = pd.DataFrame(rows, columns=cols)
-    if not out.empty:
-        out["pct"] = out["acertos"] / out["question_count"] * 100
-    return out
+    return _filter_by_accounts(_read_b2b_parquet("enamed_results.parquet"), account_ids)
 
 
 # Mínimo de mock-takers num mês pra confiar nos percentis e recalibrar o canal.
@@ -1751,7 +1533,7 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
             _enamed_ids = tuple(sorted(int(a) for a in cohort["account_id"].tolist()))
             enamed_df = load_enamed_2026_results(_enamed_ids)
         except Exception as _e:
-            st.error(f"Falha ao carregar ENAMED do Aurora: {_e}")
+            st.error(f"Falha ao carregar ENAMED: {_e}")
             enamed_df = pd.DataFrame()
 
         if enamed_df.empty:
@@ -2659,7 +2441,7 @@ with tab_qualidade:
         materiais = load_avaliacoes_materiais(_acc_ids)
         flashcards = load_avaliacoes_flashcards(_acc_ids)
     except Exception as e:
-        st.error(f"Falha ao carregar avaliações do Aurora: {e}")
+        st.error(f"Falha ao carregar avaliações: {e}")
         st.stop()
     ebook = materiais[materiais["tipo_material"] == "EBOOK"].drop(columns=["tipo_material"])
     resumo = materiais[materiais["tipo_material"] == "SUMMARY"].drop(columns=["tipo_material"])
