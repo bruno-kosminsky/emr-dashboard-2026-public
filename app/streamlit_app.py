@@ -284,8 +284,10 @@ def _normalize_canonico(d: pd.DataFrame) -> pd.DataFrame:
     ren = {
         "m10_acertos": "acerto_canonico_acertos",
         "m10_questao_count": "acerto_canonico_questao_count",
+        "m10_pct": "acerto_canonico_pct",
         "m10_acertos_7d": "acerto_canonico_acertos_7d",
         "m10_questao_count_7d": "acerto_canonico_questao_count_7d",
+        "m10_pct_7d": "acerto_canonico_pct_7d",
     }
     cols = {k: v for k, v in ren.items() if k in d.columns and v not in d.columns}
     return d.rename(columns=cols) if cols else d
