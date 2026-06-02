@@ -319,6 +319,65 @@ PRESCRIPTION_MEANING = {
 # ============================================================
 
 @st.cache_data(ttl=60 * 60)
+# --- Fonte dos dados: release privado (runtime, via DATA_TOKEN) ou disco (dev local).
+# Os parquets já vêm com big_area_id resolvido e SEM PII (só account_id + métricas).
+def _data_token() -> str | None:
+    try:
+        return st.secrets.get("DATA_TOKEN") or os.getenv("DATA_TOKEN")
+    except Exception:
+        return os.getenv("DATA_TOKEN")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _release_asset_urls(token: str) -> dict[str, str]:
+    """Mapa asset_name → api_url do release privado (tag DATA_TAG)."""
+    r = requests.get(
+        f"https://api.github.com/repos/{DATA_REPO}/releases/tags/{DATA_TAG}",
+        headers={"Authorization": f"token {token}",
+                 "Accept": "application/vnd.github+json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return {a["name"]: a["url"] for a in r.json().get("assets", [])}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_data_file(asset_name: str) -> str | None:
+    """Baixa um asset do release privado para /tmp e retorna o caminho local.
+    Retorna None se não houver token (dev local cai no disco)."""
+    token = _data_token()
+    if not token:
+        return None
+    urls = _release_asset_urls(token)
+    if asset_name not in urls:
+        return None
+    r = requests.get(
+        urls[asset_name],
+        headers={"Authorization": f"token {token}",
+                 "Accept": "application/octet-stream"},
+        timeout=120,
+    )
+    r.raise_for_status()
+    dst = Path(tempfile.gettempdir()) / f"emrdash_{asset_name}"
+    dst.write_bytes(r.content)
+    return str(dst)
+
+
+def _read_parquet_source(asset_name: str, local_path: Path) -> pd.DataFrame:
+    """Lê um parquet: do release privado (se houver DATA_TOKEN) ou do disco (dev).
+    DataFrame vazio se ausente em ambos."""
+    remote = _fetch_data_file(asset_name)
+    src = Path(remote) if remote else local_path
+    if not Path(src).exists():
+        return pd.DataFrame()
+    return pd.read_parquet(src)
+
+
+def _read_b2b_parquet(name: str) -> pd.DataFrame:
+    """Lê um parquet B2B (release: prefixo 'b2b__'; disco: snapshots/b2b/)."""
+    return _read_parquet_source(f"b2b__{name}", SNAPSHOTS_B2B_DIR / name)
+
+
 def _normalize_canonico(d: pd.DataFrame) -> pd.DataFrame:
     """Compat de esquema: o ETL B2C renomeou as colunas de acerto canônico para
     'm10_*'; o B2B e o app usam 'acerto_canonico_*'. Renomeia m10_* → canônico
@@ -385,66 +444,6 @@ except (FileNotFoundError, OSError):
 BIG_AREAS_ORDER = [("CM", 2), ("CG", 1), ("PED", 3), ("GO", 4), ("PREV", 5)]
 BIG_AREAS_NOMES = {1: "Cirurgia", 2: "Clínica Médica", 3: "Pediatria",
                    4: "Ginecologia/Obstetrícia", 5: "Med. Preventiva"}
-
-
-# --- Leitura de parquets pré-calculados (gerados 1x/dia por gen_public_snapshots.py).
-# Os parquets já vêm com big_area_id resolvido e SEM PII (só account_id + métricas).
-@st.cache_data(ttl=60 * 60)
-def _data_token() -> str | None:
-    try:
-        return st.secrets.get("DATA_TOKEN") or os.getenv("DATA_TOKEN")
-    except Exception:
-        return os.getenv("DATA_TOKEN")
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _release_asset_urls(token: str) -> dict[str, str]:
-    """Mapa asset_name → api_url do release privado (tag DATA_TAG)."""
-    r = requests.get(
-        f"https://api.github.com/repos/{DATA_REPO}/releases/tags/{DATA_TAG}",
-        headers={"Authorization": f"token {token}",
-                 "Accept": "application/vnd.github+json"},
-        timeout=30,
-    )
-    r.raise_for_status()
-    return {a["name"]: a["url"] for a in r.json().get("assets", [])}
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_data_file(asset_name: str) -> str | None:
-    """Baixa um asset do release privado para /tmp e retorna o caminho local.
-    Retorna None se não houver token (dev local cai no disco)."""
-    token = _data_token()
-    if not token:
-        return None
-    urls = _release_asset_urls(token)
-    if asset_name not in urls:
-        return None
-    r = requests.get(
-        urls[asset_name],
-        headers={"Authorization": f"token {token}",
-                 "Accept": "application/octet-stream"},
-        timeout=120,
-    )
-    r.raise_for_status()
-    dst = Path(tempfile.gettempdir()) / f"emrdash_{asset_name}"
-    dst.write_bytes(r.content)
-    return str(dst)
-
-
-def _read_parquet_source(asset_name: str, local_path: Path) -> pd.DataFrame:
-    """Lê um parquet: do release privado (se houver DATA_TOKEN) ou do disco (dev).
-    DataFrame vazio se ausente em ambos."""
-    remote = _fetch_data_file(asset_name)
-    src = Path(remote) if remote else local_path
-    if not Path(src).exists():
-        return pd.DataFrame()
-    return pd.read_parquet(src)
-
-
-def _read_b2b_parquet(name: str) -> pd.DataFrame:
-    """Lê um parquet B2B (release: prefixo 'b2b__'; disco: snapshots/b2b/)."""
-    return _read_parquet_source(f"b2b__{name}", SNAPSHOTS_B2B_DIR / name)
 
 
 def _filter_by_accounts(df: pd.DataFrame, account_ids: tuple[int, ...]) -> pd.DataFrame:
