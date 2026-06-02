@@ -7,6 +7,8 @@ Foco: responder em 30s "onde a turma está hoje e pra onde está indo".
 
 from __future__ import annotations
 
+import os
+import tempfile
 from datetime import date
 from pathlib import Path
 
@@ -14,18 +16,58 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import requests
 import streamlit as st
 
-# App público: NÃO conecta no Aurora em runtime. Toda fonte (snapshots semanais,
-# resultados ENAMED, avaliações da aba Qualidade) é lida de parquets gerados 1x/dia
-# pelo ETL (etl/gen_public_snapshots.py) e publicados no repo emr-dashboard-2026-public.
-# Sem credenciais, sem psycopg2 — o app nunca quebra por banco fora do ar.
+# App público: NÃO conecta no Aurora em runtime. Os parquets anonimizados (gerados
+# 1x/dia pelo ETL) vivem num GitHub Release PRIVADO; o app os baixa em runtime com um
+# token só-leitura (st.secrets["DATA_TOKEN"]). Assim o repositório do app pode ser
+# público (sem nenhum dado) e o acesso é controlado só pela senha. Em dev local (sem
+# DATA_TOKEN), lê os parquets do disco em snapshots/.
 
 ROOT = Path(__file__).resolve().parent.parent
 SNAPSHOTS = ROOT / "snapshots"
 SNAPSHOTS_B2B_DIR = SNAPSHOTS / "b2b"
 
+# Repo privado e tag do release que hospeda os parquets.
+DATA_REPO = "brunokosminsky-svg/emr-dashboard-2026"
+DATA_TAG = "latest-data"
+
 st.set_page_config(page_title="Dashboard EMR · R1 2026", layout="wide", initial_sidebar_state="collapsed")
+
+
+def _require_password() -> None:
+    """Gate de senha única compartilhada. A senha (hash bcrypt) vive em
+    st.secrets["APP_PASSWORD_HASH"] no Streamlit Cloud — nunca no repositório.
+    Se o secret não existir (ex.: rodando local sem secrets), o app libera o
+    acesso para não bloquear o desenvolvimento."""
+    try:
+        pw_hash = st.secrets.get("APP_PASSWORD_HASH")
+    except Exception:
+        pw_hash = None
+    if not pw_hash:
+        return  # sem senha configurada → acesso liberado (dev/local)
+    if st.session_state.get("_authed"):
+        return
+    import bcrypt
+    st.markdown("#### Dashboard EMR · R1 2026")
+    with st.form("login"):
+        senha = st.text_input("Senha de acesso", type="password")
+        entrar = st.form_submit_button("Entrar")
+    if entrar:
+        try:
+            ok = bcrypt.checkpw(senha.encode(), pw_hash.encode() if isinstance(pw_hash, str) else pw_hash)
+        except Exception:
+            ok = False
+        if ok:
+            st.session_state["_authed"] = True
+            st.rerun()
+        else:
+            st.error("Senha incorreta.")
+    st.stop()
+
+
+_require_password()
 
 st.markdown(
     """
@@ -294,15 +336,21 @@ def _normalize_canonico(d: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_snapshot(snap_dir: Path = SNAPSHOTS):
-    df = _normalize_canonico(pd.read_parquet(snap_dir / "latest.parquet"))
-    cohort = pd.read_parquet(snap_dir / "latest_cohort.parquet")
-    metrics = _normalize_canonico(pd.read_parquet(snap_dir / "latest_cohort_metrics.parquet"))
+    # B2C: asset do release com nome simples; B2B usa _read_b2b_parquet (prefixo b2b__).
+    is_b2b = snap_dir == SNAPSHOTS_B2B_DIR
+    pref = "b2b__" if is_b2b else ""
+    df = _normalize_canonico(_read_parquet_source(f"{pref}latest.parquet", snap_dir / "latest.parquet"))
+    cohort = _read_parquet_source(f"{pref}latest_cohort.parquet", snap_dir / "latest_cohort.parquet")
+    metrics = _normalize_canonico(_read_parquet_source(f"{pref}latest_cohort_metrics.parquet", snap_dir / "latest_cohort_metrics.parquet"))
     df["semana_iso"] = pd.to_datetime(df["semana_iso"])
     for d in (df, cohort, metrics):
         d["account_id"] = d["account_id"].astype(int)
-    snap_date = pd.Timestamp(
-        (snap_dir / "latest.parquet").resolve().stat().st_mtime, unit="s", tz="UTC"
-    ).tz_convert("America/Sao_Paulo")
+    # Data do snapshot: mtime do arquivo local (dev) ou agora (release/runtime).
+    local = snap_dir / "latest.parquet"
+    if not _data_token() and local.exists():
+        snap_date = pd.Timestamp(local.resolve().stat().st_mtime, unit="s", tz="UTC").tz_convert("America/Sao_Paulo")
+    else:
+        snap_date = pd.Timestamp.now(tz="America/Sao_Paulo")
     return df, cohort, metrics, snap_date
 
 
@@ -342,12 +390,61 @@ BIG_AREAS_NOMES = {1: "Cirurgia", 2: "Clínica Médica", 3: "Pediatria",
 # --- Leitura de parquets pré-calculados (gerados 1x/dia por gen_public_snapshots.py).
 # Os parquets já vêm com big_area_id resolvido e SEM PII (só account_id + métricas).
 @st.cache_data(ttl=60 * 60)
-def _read_b2b_parquet(name: str) -> pd.DataFrame:
-    """Lê um parquet de snapshots/b2b/. DataFrame vazio se não existir."""
-    p = SNAPSHOTS_B2B_DIR / name
-    if not p.exists():
+def _data_token() -> str | None:
+    try:
+        return st.secrets.get("DATA_TOKEN") or os.getenv("DATA_TOKEN")
+    except Exception:
+        return os.getenv("DATA_TOKEN")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _release_asset_urls(token: str) -> dict[str, str]:
+    """Mapa asset_name → api_url do release privado (tag DATA_TAG)."""
+    r = requests.get(
+        f"https://api.github.com/repos/{DATA_REPO}/releases/tags/{DATA_TAG}",
+        headers={"Authorization": f"token {token}",
+                 "Accept": "application/vnd.github+json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return {a["name"]: a["url"] for a in r.json().get("assets", [])}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_data_file(asset_name: str) -> str | None:
+    """Baixa um asset do release privado para /tmp e retorna o caminho local.
+    Retorna None se não houver token (dev local cai no disco)."""
+    token = _data_token()
+    if not token:
+        return None
+    urls = _release_asset_urls(token)
+    if asset_name not in urls:
+        return None
+    r = requests.get(
+        urls[asset_name],
+        headers={"Authorization": f"token {token}",
+                 "Accept": "application/octet-stream"},
+        timeout=120,
+    )
+    r.raise_for_status()
+    dst = Path(tempfile.gettempdir()) / f"emrdash_{asset_name}"
+    dst.write_bytes(r.content)
+    return str(dst)
+
+
+def _read_parquet_source(asset_name: str, local_path: Path) -> pd.DataFrame:
+    """Lê um parquet: do release privado (se houver DATA_TOKEN) ou do disco (dev).
+    DataFrame vazio se ausente em ambos."""
+    remote = _fetch_data_file(asset_name)
+    src = Path(remote) if remote else local_path
+    if not Path(src).exists():
         return pd.DataFrame()
-    return pd.read_parquet(p)
+    return pd.read_parquet(src)
+
+
+def _read_b2b_parquet(name: str) -> pd.DataFrame:
+    """Lê um parquet B2B (release: prefixo 'b2b__'; disco: snapshots/b2b/)."""
+    return _read_parquet_source(f"b2b__{name}", SNAPSHOTS_B2B_DIR / name)
 
 
 def _filter_by_accounts(df: pd.DataFrame, account_ids: tuple[int, ...]) -> pd.DataFrame:
