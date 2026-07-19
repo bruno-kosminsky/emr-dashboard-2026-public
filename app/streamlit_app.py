@@ -415,13 +415,19 @@ def load_snapshot(snap_dir: Path = SNAPSHOTS):
 
 df, cohort, metrics_acum, snapshot_date = load_snapshot()
 
+# Turmas fora do dashboard B2C — trials não são pagantes (decisão 2026-07-13).
+# O ETL (queries/01_cohort.sql) também exclui na origem; este filtro defensivo
+# cobre parquets gerados antes da mudança. Remove linhas de turma, não contas:
+# aluno trial que também tem matrícula paga permanece pela turma paga.
+TURMAS_EXCLUIDAS = {"Teste Grátis"}
+
 # Cohort B2C tem 1 linha por (account_id, turma) — alunos em 2+ turmas duplicam.
 # `cohort_turma` preserva a coluna `turma` (pra filtros). `cohort` global é
 # deduplicado por account_id (mantém a 1ª turma observada, pra compat com
 # aggregate_month e demais funções que esperam 1 linha por aluno).
 if "turma" in cohort.columns:
-    cohort_turma = cohort.copy()
-    cohort = cohort.drop_duplicates("account_id", keep="first").drop(columns=["turma"])
+    cohort_turma = cohort[~cohort["turma"].isin(TURMAS_EXCLUIDAS)].copy()
+    cohort = cohort_turma.drop_duplicates("account_id", keep="first").drop(columns=["turma"])
 else:
     cohort_turma = cohort.assign(turma="Geral")
 
@@ -476,38 +482,51 @@ def load_avaliacoes_flashcards(account_ids: tuple[int, ...]) -> pd.DataFrame:
     return _filter_by_accounts(_read_b2b_parquet("avaliacoes_flashcards.parquet"), account_ids)
 
 
-# Simulados ENAMED Inspirali oficiais aplicados em 2026 (sem testes/sandbox).
-# Descobertos automaticamente no Aurora por load_enamed_2026_templates() — a lista
-# abaixo é apenas o FALLBACK usado se a query de descoberta falhar/voltar vazia
-# (mantida em ordem cronológica). Não precisa ser editada quando um novo simulado
-# é aplicado: o app passa a exibi-lo sozinho assim que ≥100 alunos o finalizam.
-ENAMED_2026_TEMPLATES_FALLBACK: list[tuple[int, str, str]] = [
-    (15798, "1º Simulado ENAMED Inspirali 2026", "2026-02-26"),
-    (17948, "2º Simulado ENAMED Inspirali 2026", "2026-04-28"),
-    (19994, "3º Simulado ENAMED Inspirali 2026", "2026-05-30"),
+# Simulados institucionais ENAMED 2026 (Inspirali, FMO, FACAPE, …).
+# Fonte de verdade: registro curado em etl/simulados_registry.py, materializado
+# 1x/dia pelo ETL em enamed_templates.parquet — 1 linha por EDIÇÃO. Uma edição
+# pode agrupar 2+ templates (ex.: 3º Inspirali = Provas 1+2).
+# Decisão 2026-07-13: nome de template não é confiável pra descoberta — o ETL
+# só ALERTA candidatos não mapeados; quem decide exibição é o registro.
+# A lista abaixo é apenas o FALLBACK usado se o parquet faltar.
+ENAMED_2026_EDICOES_FALLBACK: list[dict] = [
+    {"edicao_id": 1, "nome": "1º Simulado ENAMED — Inspirali 2026", "ies": "Inspirali",
+     "data": "2026-02-26", "template_ids": (15798,)},
+    {"edicao_id": 2, "nome": "2º Simulado ENAMED — Inspirali 2026", "ies": "Inspirali",
+     "data": "2026-04-28", "template_ids": (17948,)},
+    {"edicao_id": 3, "nome": "3º Simulado ENAMED — Inspirali 2026 (Provas 1+2)", "ies": "Inspirali",
+     "data": "2026-05-30", "template_ids": (19994, 20390)},
+    {"edicao_id": 4, "nome": "4º Simulado ENAMED — Inspirali 2026", "ies": "Inspirali",
+     "data": "2026-06-17", "template_ids": (21446,)},
+    {"edicao_id": 5, "nome": "1º Simulado ENAMED — FACAPE 2026", "ies": "FACAPE",
+     "data": "2026-06-01", "template_ids": (20028,)},
+    {"edicao_id": 6, "nome": "1º Simulado ENAMED — FMO 2026", "ies": "FMO",
+     "data": "2026-06-25", "template_ids": (21644,)},
 ]
-
-# Mínimo de alunos que finalizaram o simulado para ele contar como "oficial"
-# (separa com folga os oficiais — milhares — de testes/sandbox e Rounds).
-ENAMED_MIN_ALUNOS = 100
 
 
 @st.cache_data(ttl=60 * 60)
-def load_enamed_2026_templates() -> list[tuple[int, str, str]]:
-    """Lista os simulados ENAMED Inspirali 2026 oficiais a partir do parquet
-    pré-calculado (enamed_templates.parquet), em ordem cronológica.
+def load_enamed_2026_templates() -> list[dict]:
+    """Edições de simulados institucionais ENAMED 2026, do parquet pré-calculado
+    (enamed_templates.parquet), em ordem cronológica.
 
-    O parquet é gerado 1x/dia pelo ETL (descoberta: nome casa
-    'Nº Simulado Enamed - Inspirali 2026', exclui TESTE, ≥100 alunos). Se o
-    parquet faltar, cai para o fallback hardcoded.
-
-    Retorna lista de (mock_template_id, nome, data_aplicacao_iso).
+    Retorna dicts {edicao_id, nome, ies, data, template_ids}. Tolera o schema
+    antigo (1 linha por template, sem edicao_id) — cobre a janela de cache de
+    até 1h entre o deploy do app e a regeneração do release de dados.
     """
     df = _read_b2b_parquet("enamed_templates.parquet")
     if df.empty:
-        return list(ENAMED_2026_TEMPLATES_FALLBACK)
+        return [dict(e) for e in ENAMED_2026_EDICOES_FALLBACK]
+    if "edicao_id" not in df.columns:  # schema antigo (pré 2026-07-13)
+        return [
+            {"edicao_id": i + 1, "nome": str(r.nome), "ies": "Inspirali",
+             "data": str(r.data_aplicacao), "template_ids": (int(r.mock_template_id),)}
+            for i, r in enumerate(df.itertuples())
+        ]
     return [
-        (int(r.mock_template_id), str(r.nome), str(r.data_aplicacao))
+        {"edicao_id": int(r.edicao_id), "nome": str(r.nome), "ies": str(r.ies),
+         "data": str(r.data_aplicacao),
+         "template_ids": tuple(int(t) for t in r.mock_template_ids)}
         for r in df.itertuples()
     ]
 
@@ -517,7 +536,8 @@ def load_enamed_2026_results(account_ids: tuple[int, ...]) -> pd.DataFrame:
     """Resultados ENAMED 2026 por aluno, do parquet pré-calculado
     (enamed_results.parquet), filtrados pelos account_ids do grupo.
 
-    Colunas: account_id, mock_template_id, question_count, acertos, pct.
+    Colunas: account_id, mock_template_id, question_count, acertos, pct
+    (+ edicao_id no schema novo; 1 linha por aluno por edição — 1ª tentativa).
     """
     return _filter_by_accounts(_read_b2b_parquet("enamed_results.parquet"), account_ids)
 
@@ -1568,7 +1588,15 @@ def _render_agora_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pr
         last_closed = months_closed[-1]
         prev_closed = months_closed[-2] if len(months_closed) >= 2 else None
         cur_per = aggregate_month(df, last_closed, cohort_df=cohort)
-        st.caption(f"**{label_grupo}** — {total:,} alunos. Snapshot {snapshot_date:%d/%m %H:%M}.")
+        # "com Revisão" = flag transversal do cohort (combo, espelho ou standalone).
+        # Guard: parquets anteriores a 2026-07 não têm a coluna.
+        _rev_txt = ""
+        if "tem_revisao" in cohort_filtrado.columns:
+            _n_rev = int(cohort_filtrado.loc[
+                cohort_filtrado["tem_revisao"].fillna(False).astype(bool), "account_id"
+            ].nunique())
+            _rev_txt = f" · {_n_rev:,} com Revisão ({_n_rev / total * 100:.0f}%)" if total else ""
+        st.caption(f"**{label_grupo}** — {total:,} alunos{_rev_txt}. Snapshot {snapshot_date:%d/%m %H:%M}.")
         _render_agora_now(key_prefix=key_prefix)
     finally:
         df, cohort, total, months_closed, last_closed, prev_closed, cur_per = _saves
@@ -1604,11 +1632,13 @@ with tab_agora:
 
 
 # Aba B2B — sub-abas Inspirali (15 escolas) e Geral (grupos educacionais).
-def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_prefix: str = "b2b"):
+def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_prefix: str = "b2b",
+                       ies_filtro: str | None = None):
     """Renderiza os blocos da aba Agora para um subset filtrado do cohort B2B.
 
     Faz swap das globais (df, cohort, total, last_closed, etc.) pra que
-    `_render_agora_now()` use o subset filtrado.
+    `_render_agora_now()` use o subset filtrado. `ies_filtro` restringe a tabela
+    de simulados institucionais às edições da IES do grupo (None = todas).
     """
     if cohort_filtrado.empty:
         st.warning(f"Nenhum aluno em `{label_grupo}` no cohort B2B.")
@@ -1637,10 +1667,13 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
         )
         _render_agora_now(key_prefix=key_prefix)
 
-        # --- Bloco ENAMED Inspirali 2026: desempenho do grupo ---
+        # --- Bloco simulados institucionais ENAMED 2026: desempenho do grupo ---
         st.markdown("&nbsp;")
-        st.markdown("##### Simulados ENAMED Inspirali 2026")
-        st.caption("Apenas mocks finalizados. % ≥ 60 = alunos com 60%+ de acerto.")
+        st.markdown("##### Simulados institucionais ENAMED 2026")
+        st.caption(
+            "Apenas mocks finalizados; aluno que fez 2 provas da mesma edição "
+            "conta 1x (primeira tentativa). % ≥ 60 = alunos com 60%+ de acerto."
+        )
         try:
             _enamed_ids = tuple(sorted(int(a) for a in cohort["account_id"].tolist()))
             enamed_df = load_enamed_2026_results(_enamed_ids)
@@ -1648,16 +1681,23 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
             st.error(f"Falha ao carregar ENAMED: {_e}")
             enamed_df = pd.DataFrame()
 
-        if enamed_df.empty:
-            st.info(f"Nenhum aluno deste grupo finalizou um simulado ENAMED Inspirali 2026.")
+        edicoes = [e for e in load_enamed_2026_templates()
+                   if ies_filtro is None or e["ies"] == ies_filtro]
+        if not edicoes:
+            st.info(f"Nenhum simulado institucional mapeado para `{label_grupo}`.")
+        elif enamed_df.empty:
+            st.info("Nenhum aluno deste grupo finalizou um simulado institucional ENAMED 2026.")
         else:
             rows_html = []
-            for tid, tname, tdate in load_enamed_2026_templates():
-                sub = enamed_df[enamed_df["mock_template_id"] == tid]
+            for ed in edicoes:
+                sub = enamed_df[enamed_df["mock_template_id"].isin(ed["template_ids"])]
+                # Defensivo: parquet novo já vem 1 linha por aluno por edição;
+                # cobre schema antigo (aluno em 2 provas da mesma edição).
+                sub = sub.drop_duplicates("account_id")
                 if sub.empty:
                     rows_html.append(
-                        f"<tr><td class='dim'>{tname}</td>"
-                        f"<td class='val' style='color:#71717a'>{tdate}</td>"
+                        f"<tr><td class='dim'>{ed['nome']}</td>"
+                        f"<td class='val' style='color:#71717a'>{ed['data']}</td>"
                         f"<td class='val' style='color:#B8B8B8' colspan='4'>sem participação</td></tr>"
                     )
                     continue
@@ -1669,8 +1709,8 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
                 cor60 = "#04A36A" if pct_60 >= 60 else ("#EAB904" if pct_60 >= 40 else "#E64444")
                 rows_html.append(
                     f"<tr>"
-                    f"<td class='dim'>{tname}</td>"
-                    f"<td class='val' style='color:#71717a'>{tdate}</td>"
+                    f"<td class='dim'>{ed['nome']}</td>"
+                    f"<td class='val' style='color:#71717a'>{ed['data']}</td>"
                     f"<td class='val'>{n:,}<br><span style='font-size:11px;color:#71717a'>{cov:.0f}% do grupo</span></td>"
                     f"<td class='val'>{media:.1f}%</td>"
                     f"<td class='val'>{mediana:.1f}%</td>"
@@ -1691,15 +1731,20 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
                 </table>""",
                 unsafe_allow_html=True,
             )
-            # Agregado
-            tot_n = len(enamed_df)
-            tot_alunos = enamed_df["account_id"].nunique()
-            tot_pct_60 = (enamed_df["pct"] >= 60).mean() * 100
-            tot_media = enamed_df["pct"].mean()
-            st.caption(
-                f"Total: {tot_n:,} mocks · {tot_alunos:,}/{total:,} alunos · "
-                f"média {tot_media:.1f}% · {tot_pct_60:.1f}% ≥ 60."
-            )
+            # Agregado — só sobre as edições exibidas.
+            _tpls_exibidos = {t for e in edicoes for t in e["template_ids"]}
+            agg = enamed_df[enamed_df["mock_template_id"].isin(_tpls_exibidos)]
+            if agg.empty:
+                st.caption("Nenhuma participação deste grupo nas edições listadas.")
+            else:
+                tot_n = len(agg)
+                tot_alunos = agg["account_id"].nunique()
+                tot_pct_60 = (agg["pct"] >= 60).mean() * 100
+                tot_media = agg["pct"].mean()
+                st.caption(
+                    f"Total: {tot_n:,} resultados · {tot_alunos:,}/{total:,} alunos · "
+                    f"média {tot_media:.1f}% · {tot_pct_60:.1f}% ≥ 60."
+                )
     finally:
         df, cohort, total = _df_save, _cohort_save, _total_save
         months_closed, last_closed, prev_closed, cur_per = _mc_save, _last_save, _prev_save, _cur_per_save
@@ -1784,15 +1829,18 @@ with tab_b2b:
                         _label = f"Inspirali · {cat_label} · {sel_ies[0]}"
                     else:
                         _label = f"Inspirali · {cat_label} · {len(sel_ies)} escolas"
-                    _render_b2b_subtab(_filtrado, _label, key_prefix=f"b2b_insp_{cat_key}")
+                    _render_b2b_subtab(_filtrado, _label, key_prefix=f"b2b_insp_{cat_key}",
+                                       ies_filtro="Inspirali")
 
         with sub_geral:
-            companies = (
-                cohort_b2b[["company_id", "company_name"]]
-                .drop_duplicates()
-                .sort_values("company_name")
+            # Lista grupos por company_name ÚNICO. O mesmo grupo (ex.: Inspirali, FMO,
+            # FARESI) tem 2 company_id — o oficial e o company_id=1 (EMR, "Limbo IES"
+            # de alunos atrelados ao parceiro). Deduplicar por (id, nome) repetia o
+            # grupo no filtro; deduplicar só por nome lista cada grupo uma vez e o
+            # filtro (isin company_name) já agrega os dois company_id.
+            companies_list = sorted(
+                cohort_b2b["company_name"].dropna().astype(str).unique().tolist()
             )
-            companies_list = companies["company_name"].tolist()
             st.caption(f"{len(companies_list)} grupos · selecione 1 ou mais:")
             sel_co = st.multiselect(
                 "Grupos educacionais",
@@ -1811,7 +1859,10 @@ with tab_b2b:
                     _label = f"Grupo · {sel_co[0]}"
                 else:
                     _label = f"{len(sel_co)} grupos: {', '.join(sel_co)}"
-                _render_b2b_subtab(_filtrado, _label, key_prefix="b2b_geral_multi")
+                # 1 grupo selecionado → só as edições da IES dele; vários → todas.
+                _ies_unica = sel_co[0] if len(sel_co) == 1 else None
+                _render_b2b_subtab(_filtrado, _label, key_prefix="b2b_geral_multi",
+                                   ies_filtro=_ies_unica)
 
 
 # ============================================================
@@ -2546,7 +2597,10 @@ with tab_evolucao:
 
 with tab_qualidade:
     st.markdown("##### Qualidade do conteúdo")
-    st.caption("Notas 1-5 dadas pelos alunos em aulas e comentários de questões (jan/26 → hoje).")
+    st.caption(
+        "Notas 1-5 dadas pelos alunos. Resultado oficial = último mês fechado "
+        f"({PRESCRIPTION_MONTHLY[last_closed]['label']}); o mês corrente aparece à parte, como parcial."
+    )
 
     _acc_ids = tuple(sorted(int(a) for a in cohort["account_id"].tolist()))
     try:
@@ -2572,9 +2626,12 @@ with tab_qualidade:
             }
         return out
 
-    def _render_qualidade_table(d: pd.DataFrame, label: str) -> str:
+    def _render_qualidade_table(d: pd.DataFrame, label: str, alunos_area: bool = False) -> str:
         if d.empty:
-            return f"<p style='color:#71717a'>Sem avaliações de {label.lower()} no período.</p>"
+            return (
+                f"<tr><td class='dim'>{label}</td>"
+                f"<td class='val' style='color:#B8B8B8' colspan='6'>sem avaliações no mês</td></tr>"
+            )
         # Geral primeiro
         geral_avg = float(d["rate"].mean())
         geral_n = int(len(d))
@@ -2596,10 +2653,11 @@ with tab_qualidade:
             else:
                 # Cor sutil: 4.5+ verde, 4.0-4.5 amarelo, <4 vermelho
                 cor = "#04A36A" if info["avg"] >= 4.5 else ("#EAB904" if info["avg"] >= 4.0 else "#E64444")
+                extra = f" · {info['n_alunos']:,} alunos" if alunos_area else ""
                 cells.append(
                     f"<td class='val'>"
                     f"<span style='font-size:16px;color:{cor};font-weight:600'>★ {info['avg']:.2f}</span>"
-                    f"<br><span style='font-size:11px;color:#71717a'>n={info['n']:,}</span></td>"
+                    f"<br><span style='font-size:11px;color:#71717a'>n={info['n']:,}{extra}</span></td>"
                 )
         return (
             f"<tr><td class='dim'>{label}</td>{''.join(cells)}</tr>"
@@ -2614,19 +2672,64 @@ with tab_qualidade:
             for sigla, _ in BIG_AREAS_ORDER
         )
     )
+
+    def _tabela_qualidade(rows_html: str) -> None:
+        st.markdown(
+            f"<table class='gap-table'>"
+            f"<thead><tr><th>Conteúdo</th>{header_cols}</tr></thead>"
+            f"<tbody>{rows_html}</tbody></table>",
+            unsafe_allow_html=True,
+        )
+
+    _CONTEUDOS_TABELA = [
+        ("Aulas", aulas),
+        ("Comentários de questões", questoes),
+        ("E-book", ebook),
+        ("Resumo", resumo),
+        ("Mapa mental", mapa),
+        ("Flashcards", flashcards),
+    ]
+
+    def _slice_mes(d: pd.DataFrame, ref: pd.Timestamp) -> pd.DataFrame:
+        return d[pd.to_datetime(d["mes"]) == ref] if not d.empty else d
+
+    # Resultado oficial = só o último mês fechado. Parcial = mês mais recente
+    # nos dados depois do fechado (em produção, o mês calendário corrente).
+    _mes_oficial = pd.Timestamp(f"{last_closed}-01")
     st.markdown(
-        f"<table class='gap-table'>"
-        f"<thead><tr><th>Conteúdo</th>{header_cols}</tr></thead>"
-        f"<tbody>"
-        f"{_render_qualidade_table(aulas, 'Aulas')}"
-        f"{_render_qualidade_table(questoes, 'Comentários de questões')}"
-        f"{_render_qualidade_table(ebook, 'E-book')}"
-        f"{_render_qualidade_table(resumo, 'Resumo')}"
-        f"{_render_qualidade_table(mapa, 'Mapa mental')}"
-        f"{_render_qualidade_table(flashcards, 'Flashcards')}"
-        f"</tbody></table>",
-        unsafe_allow_html=True,
+        f"###### Resultado oficial — {PRESCRIPTION_MONTHLY[last_closed]['label']} (mês fechado)"
     )
+    _tabela_qualidade("".join(
+        _render_qualidade_table(_slice_mes(d, _mes_oficial), lab,
+                                alunos_area=(lab == "Comentários de questões"))
+        for lab, d in _CONTEUDOS_TABELA
+    ))
+
+    _meses_all = pd.concat(
+        [pd.to_datetime(d["mes"]) for _l, d in _CONTEUDOS_TABELA if not d.empty],
+        ignore_index=True,
+    ) if any(not d.empty for _l, d in _CONTEUDOS_TABELA) else pd.Series(dtype="datetime64[ns]")
+    _ref_parcial = _meses_all.max() if not _meses_all.empty else None
+    if _ref_parcial is not None and _ref_parcial > _mes_oficial:
+        _lbl_parcial = _format_mes(_ref_parcial.strftime("%Y-%m"))
+        st.markdown("&nbsp;")
+        st.markdown(f"###### Mês corrente — {_lbl_parcial} (parcial, em andamento)")
+        _parciais = {lab: _slice_mes(d, _ref_parcial) for lab, d in _CONTEUDOS_TABELA}
+        _tabela_qualidade("".join(
+            _render_qualidade_table(p, lab, alunos_area=(lab == "Comentários de questões"))
+            for lab, p in _parciais.items()
+        ))
+        _baixos = [
+            (lab, float(p["rate"].mean()))
+            for lab, p in _parciais.items()
+            if not p.empty and float(p["rate"].mean()) <= 4.0
+        ]
+        if _baixos:
+            st.warning(
+                "Média parcial ≤ 4,0 em: "
+                + " · ".join(f"**{lab}** ({v:.2f})" for lab, v in _baixos)
+                + f" — {_lbl_parcial} ainda em andamento, amostra parcial."
+            )
     st.caption("Cores: 🟢 ≥4,5 · 🟡 4,0-4,5 · 🔴 <4,0 · n = avaliações.")
 
     # --- Evolução mensal ---
