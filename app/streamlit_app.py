@@ -502,6 +502,8 @@ ENAMED_2026_EDICOES_FALLBACK: list[dict] = [
      "data": "2026-06-01", "template_ids": (20028,)},
     {"edicao_id": 6, "nome": "1º Simulado ENAMED — FMO 2026", "ies": "FMO",
      "data": "2026-06-25", "template_ids": (21644,)},
+    {"edicao_id": 7, "nome": "5º Simulado ENAMED — Inspirali 2026", "ies": "Inspirali",
+     "data": "2026-07-14", "template_ids": (22535,)},
 ]
 
 
