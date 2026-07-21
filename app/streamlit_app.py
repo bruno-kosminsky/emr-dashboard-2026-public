@@ -1337,6 +1337,46 @@ def _render_agora_now(key_prefix: str = "agora"):
         unsafe_allow_html=True,
     )
 
+    # --- Questões por aluno/semana: média e mediana do grupo filtrado.
+    # Denominador = cohort inteiro (zeros incluídos — aluno sem atividade conta 0).
+    # Última semana ISO completa = semana anterior à corrente; corrente = parcial.
+    _cohort_ids_q = cohort["account_id"].astype(int).tolist()
+    _cur_monday = today - pd.Timedelta(days=int(today.weekday()))
+    _full_monday = _cur_monday - pd.Timedelta(days=7)
+
+    def _q_semana(monday: pd.Timestamp) -> tuple[float, float] | None:
+        sub = df[df["semana_iso"] == monday]
+        if sub.empty:
+            return None
+        per = sub.groupby("account_id")["questoes"].sum().reindex(_cohort_ids_q, fill_value=0)
+        return float(per.mean()), float(per.median())
+
+    def _rng_semana(monday: pd.Timestamp) -> str:
+        return f"{monday:%d/%m}–{monday + pd.Timedelta(days=6):%d/%m}"
+
+    _q_full = _q_semana(_full_monday)
+    _q_part = _q_semana(_cur_monday)
+    if _q_full or _q_part:
+        st.markdown("&nbsp;")
+        qc1, qc2, qc3, qc4 = st.columns(4)
+        for _col, _dados, _tit, _monday, _cor in (
+            (qc1, _q_full, "Questões/aluno — média", _full_monday, "#32578A"),
+            (qc2, _q_full, "Questões/aluno — mediana", _full_monday, "#32578A"),
+            (qc3, _q_part, "Média (semana parcial)", _cur_monday, "#71717a"),
+            (qc4, _q_part, "Mediana (semana parcial)", _cur_monday, "#71717a"),
+        ):
+            if _dados is None:
+                continue
+            _val = _dados[0] if "média" in _tit.lower() else _dados[1]
+            _col.markdown(
+                f"""<div class="hero-card">
+                  <div class="lbl"><span class="pill" style="background:{_cor}"></span>{_tit}</div>
+                  <div class="val">{_val:.1f}</div>
+                  <div class="sub">semana {_rng_semana(_monday)} · zeros incluídos</div>
+                </div>""",
+                unsafe_allow_html=True,
+            )
+
     # Janela fixa: último mês fechado, com Δ vs mês anterior nos cards.
     cur_per = aggregate_month(df, last_closed)
     prev_per = aggregate_month(df, prev_closed) if prev_closed else None
@@ -2489,7 +2529,9 @@ with tab_evolucao:
     st.markdown("##### Métricas semanais avançadas")
     st.caption(
         f"Excel = alunos em Excelência em {cur_mes_label}. Geral = turma toda. "
-        "Agregação semanal sobre alunos ativos."
+        "Volumes: denominador = todos os pagantes do grupo, zeros incluídos "
+        "(regra 2026-07-19 — nunca comparar só com ativos). "
+        "% de acerto: só quem respondeu na semana."
     )
 
     # Métricas: nome → (coluna no df, tipo de cálculo)
@@ -2546,16 +2588,25 @@ with tab_evolucao:
             if prev_avg > 0 and last_vol < prev_avg * 0.3:
                 cutoff_week = weekly_vol.index[-1]
         df_closed = df_sub[df_sub["semana_iso"] < cutoff_week] if cutoff_week is not None else df_sub
-        df_ativos = df_closed[df_closed["dias_ativos"] > 0]
 
         agg_fn = "median" if agg_choice == "Mediana" else "mean"
+        # Denominador dos volumes = TODOS os pagantes do grupo (zeros incluídos).
+        # Regra 2026-07-19: métrica por aluno nunca compara só com ativos.
+        ids_grupo = sorted(account_ids_filtro) if account_ids_filtro is not None else list(_evo_ids_tuple)
 
         plots = []
         for label in selected:
             col, tipo = METRICAS_AV[label]
             if tipo == "vol":
-                serie = df_ativos.groupby("semana_iso")[col].agg(agg_fn).reset_index()
-                serie.columns = ["semana_iso", "valor"]
+                serie = (
+                    df_closed.pivot_table(index="semana_iso", columns="account_id",
+                                          values=col, aggfunc="sum")
+                    .reindex(columns=ids_grupo)
+                    .fillna(0)
+                    .agg(agg_fn, axis=1)
+                    .rename("valor")
+                    .reset_index()
+                )
             else:
                 # % de acerto: calcula pct por aluno-semana, depois agrega
                 if tipo == "ratio_can":
@@ -2628,7 +2679,30 @@ with tab_qualidade:
             }
         return out
 
-    def _render_qualidade_table(d: pd.DataFrame, label: str, alunos_area: bool = False) -> str:
+    def _coleta_atipica(d: pd.DataFrame, ref: pd.Timestamp) -> tuple[bool, int, float] | None:
+        """Compara n(ref) com a mediana de n dos 3 meses anteriores no MESMO df
+        (fonte já filtrada pro conteúdo). Atípico = n < 40% dessa mediana e
+        histórico com pelo menos 2 dos 3 meses anteriores presentes.
+        Retorna (atipico, n_ref, mediana_anterior) ou None se não dá pra avaliar.
+        """
+        if d.empty:
+            return None
+        meses = pd.to_datetime(d["mes"])
+        contagens = meses.dt.to_period("M").value_counts()
+        ref_p = ref.to_period("M")
+        n_ref = int(contagens.get(ref_p, 0))
+        anteriores = [contagens.get(ref_p - i, 0) for i in (1, 2, 3)]
+        anteriores_presentes = [n for n in anteriores if n > 0]
+        if n_ref == 0 or len(anteriores_presentes) < 2:
+            return None
+        mediana_ant = float(pd.Series(anteriores_presentes).median())
+        if mediana_ant <= 0:
+            return None
+        return (n_ref < mediana_ant * 0.4, n_ref, mediana_ant)
+
+    def _render_qualidade_table(d: pd.DataFrame, label: str, alunos_area: bool = False,
+                                fonte_completa: pd.DataFrame | None = None,
+                                ref: pd.Timestamp | None = None) -> str:
         if d.empty:
             return (
                 f"<tr><td class='dim'>{label}</td>"
@@ -2640,6 +2714,18 @@ with tab_qualidade:
         geral_alunos = int(d["account_id"].nunique())
         por_area = _agg_area(d)
         cells = []
+        # Flag de coleta atípica: volume do mês muito abaixo do histórico recente
+        # (regra 2026-07-19/20 — não silenciar mês censurado como se fosse normal;
+        # detecção estrutural, não conserto pontual de um mês só).
+        _atip = _coleta_atipica(fonte_completa, ref) if fonte_completa is not None and ref is not None else None
+        _label_html = label
+        if _atip is not None and _atip[0]:
+            _label_html = (
+                f"{label} "
+                f"<span title='n={_atip[1]} vs mediana {_atip[2]:.0f} dos 3 meses anteriores "
+                f"(&lt;40%) — coleta possivelmente incompleta; não comparar' "
+                f"style='cursor:help'>⚠️</span>"
+            )
         # Geral
         cells.append(
             f"<td class='val' style='font-weight:600;background:#FFFAE0'>"
@@ -2662,7 +2748,7 @@ with tab_qualidade:
                     f"<br><span style='font-size:11px;color:#71717a'>n={info['n']:,}{extra}</span></td>"
                 )
         return (
-            f"<tr><td class='dim'>{label}</td>{''.join(cells)}</tr>"
+            f"<tr><td class='dim'>{_label_html}</td>{''.join(cells)}</tr>"
         )
 
     # Header da tabela combinada
@@ -2703,9 +2789,15 @@ with tab_qualidade:
     )
     _tabela_qualidade("".join(
         _render_qualidade_table(_slice_mes(d, _mes_oficial), lab,
-                                alunos_area=(lab == "Comentários de questões"))
+                                alunos_area=(lab == "Comentários de questões"),
+                                fonte_completa=d, ref=_mes_oficial)
         for lab, d in _CONTEUDOS_TABELA
     ))
+    if any((_r := _coleta_atipica(d, _mes_oficial)) is not None and _r[0] for _lab, d in _CONTEUDOS_TABELA):
+        st.caption(
+            "⚠️ Conteúdo(s) com volume de avaliações muito abaixo do histórico recente no mês oficial — "
+            "possível falha de coleta; tratar a média como não comparável."
+        )
 
     _meses_all = pd.concat(
         [pd.to_datetime(d["mes"]) for _l, d in _CONTEUDOS_TABELA if not d.empty],
@@ -2717,6 +2809,8 @@ with tab_qualidade:
         st.markdown("&nbsp;")
         st.markdown(f"###### Mês corrente — {_lbl_parcial} (parcial, em andamento)")
         _parciais = {lab: _slice_mes(d, _ref_parcial) for lab, d in _CONTEUDOS_TABELA}
+        # Sem flag de coleta atípica no mês parcial: n baixo aqui é só mês
+        # incompleto, e o título já diz "(parcial, em andamento)".
         _tabela_qualidade("".join(
             _render_qualidade_table(p, lab, alunos_area=(lab == "Comentários de questões"))
             for lab, p in _parciais.items()
@@ -2732,7 +2826,7 @@ with tab_qualidade:
                 + " · ".join(f"**{lab}** ({v:.2f})" for lab, v in _baixos)
                 + f" — {_lbl_parcial} ainda em andamento, amostra parcial."
             )
-    st.caption("Cores: 🟢 ≥4,5 · 🟡 4,0-4,5 · 🔴 <4,0 · n = avaliações.")
+    st.caption("Cores: 🟢 ≥4,5 · 🟡 4,0-4,5 · 🔴 <4,0 · n = avaliações. ⚠️ = coleta atípica (n < 40% da mediana dos 3 meses anteriores).")
 
     # --- Evolução mensal ---
     st.markdown("&nbsp;")
