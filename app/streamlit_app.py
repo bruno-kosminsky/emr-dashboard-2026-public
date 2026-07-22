@@ -15,9 +15,46 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 from plotly.subplots import make_subplots
 import requests
 import streamlit as st
+
+# Paleta canônica — Brandbook EMR 2026, p.102. Espelha as CSS vars do bloco de
+# estilo abaixo; se mudar aqui, mude lá. Nomes são os do brandbook.
+EMR = {
+    "green":     "#264641",  # Residente Green — base institucional
+    "approved":  "#6CE190",  # Residente Approved
+    "lime":      "#B4F900",  # Residente Lime
+    "off_white": "#F8F8F8",  # Residente Off White
+    "orange":    "#FF7013",  # Residente Orange
+    # complementares — o brandbook as libera para sistemas web, teto de 30%
+    "blue":      "#50BCFF",
+    "red":       "#FF514D",
+    "purple":    "#9500DB",
+    "yellow":    "#FFC805",
+    "green_deep":"#009B3F",
+    # derivados do shell dark (não constam no brandbook)
+    "surface":   "#1A302C",
+    "muted":     "#93A8A2",
+    "neutral":   "#8FA39D",
+}
+
+# Template global dos gráficos. colorway = primárias de destaque + complementares,
+# que é exatamente o uso que o brandbook prevê para elas ("sistemas web").
+_emr_dark = go.layout.Template(pio.templates["plotly_white"])
+_emr_dark.layout.update(
+    font=dict(family="Outfit, sans-serif", color=EMR["off_white"]),
+    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    xaxis=dict(gridcolor="rgba(248,248,248,.08)", zerolinecolor="rgba(248,248,248,.15)"),
+    yaxis=dict(gridcolor="rgba(248,248,248,.08)", zerolinecolor="rgba(248,248,248,.15)"),
+    legend=dict(font=dict(color=EMR["off_white"])),
+    hoverlabel=dict(bgcolor=EMR["surface"], font=dict(color=EMR["off_white"])),
+    colorway=[EMR["approved"], EMR["lime"], EMR["blue"], EMR["yellow"],
+              EMR["red"], EMR["purple"], EMR["green_deep"], EMR["orange"]],
+)
+pio.templates["emr_dark"] = _emr_dark
+pio.templates.default = "emr_dark"
 
 # App público: NÃO conecta no Aurora em runtime. Os parquets anonimizados (gerados
 # 1x/dia pelo ETL) vivem num GitHub Release PRIVADO; o app os baixa em runtime com um
@@ -72,32 +109,60 @@ _require_password()
 st.markdown(
     """
     <style>
-      /* === EMR Design System v2026 (Residente) ===
-         Paleta: #6CE190 Residente Green · #B4F900 Residente Lime ·
-                 #F8F8F8 Off White · #FF514D Residente Orange.
-         Tipografia: Outfit (única). */
-      @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&display=swap');
+      /* === EMR Design System — Brandbook 2026 (p.102) ===
+         CANÔNICO (não alterar sem revisar o brandbook):
+           Residente Green    #264641  base institucional
+           Residente Approved #6CE190  aprovação · resultado · avanço
+           Residente Lime     #B4F900  performance · digital · ação
+           Residente Off White#F8F8F8  neutro · clareza · espaço
+           Residente Orange   #FF7013  call to action · virada
+         Complementares (brandbook autoriza p/ sistemas web, teto 30%):
+           #50BCFF · #FF514D · #9500DB · #FFC805 · #009B3F
+         Gradiente institucional: #6CE190 → #B4F900 (único autorizado).
+         Tipografia: Outfit — pesos autorizados: Regular 400, Medium 500, Bold 700.
+
+         DERIVADO (o brandbook não especifica tema dark de app): as superfícies
+         --emr-bg/--emr-card são escurecimentos de #264641; --emr-text-muted é
+         #264641 clareado e dessaturado. */
+      @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;700&display=swap');
 
       :root {
-        --emr-green:        #6CE190;
-        --emr-lime:         #B4F900;
-        --emr-off-white:    #F8F8F8;
-        --emr-orange:       #FF514D;
-        --emr-dark:         #0F1F1A;
-        --emr-dark-soft:    #1A2D26;
-        --emr-text:         #0A1A14;
-        --emr-text-muted:   #5A6B63;
-        --emr-line:         #E5EBE7;
-        --emr-card-bg:      #FFFFFF;
-        --emr-shadow:       0 4px 24px rgba(15, 31, 26, .06);
-        --emr-shadow-hover: 0 8px 32px rgba(15, 31, 26, .10);
+        /* --- primárias canônicas --- */
+        --emr-green:        #264641;   /* Residente Green */
+        --emr-approved:     #6CE190;   /* Residente Approved */
+        --emr-lime:         #B4F900;   /* Residente Lime */
+        --emr-off-white:    #F8F8F8;   /* Residente Off White */
+        --emr-orange:       #FF7013;   /* Residente Orange */
+
+        /* --- complementares canônicas (máx 30% de presença) --- */
+        --emr-blue:         #50BCFF;
+        --emr-red:          #FF514D;
+        --emr-purple:       #9500DB;
+        --emr-yellow:       #FFC805;
+        --emr-green-deep:   #009B3F;
+
+        /* --- superfícies derivadas de #264641 --- */
+        --emr-bg:           #101E1B;
+        --emr-card-bg:      #1A302C;
+        --emr-card-soft:    #203A35;
+        --emr-card-hi:      #264641;
+        --emr-text:         #F8F8F8;
+        --emr-text-muted:   #93A8A2;
+        --emr-neutral:      #8FA39D;
+        --emr-line:         rgba(248, 248, 248, .10);
+        --emr-track:        rgba(248, 248, 248, .09);
+
+        --emr-shadow:       0 4px 24px rgba(0, 0, 0, .28);
+        --emr-shadow-hover: 0 8px 32px rgba(0, 0, 0, .38);
         --emr-radius:       16px;
         --emr-radius-sm:    10px;
         --emr-gradient:     linear-gradient(135deg, #6CE190 0%, #B4F900 100%);
+        --emr-sidebar-w:    232px;
+        --emr-gap:          14px;
+        --emr-topbar-h:     64px;
       }
 
-      /* Background global */
-      html, body, .stApp {background: var(--emr-off-white) !important;}
+      html, body, .stApp {background: var(--emr-bg) !important;}
 
       /* Outfit em tudo */
       html, body, [class*="css"], .stMarkdown, .stCaption, .stRadio,
@@ -106,7 +171,7 @@ st.markdown(
         font-family: 'Outfit', -apple-system, BlinkMacSystemFont, sans-serif !important;
       }
 
-      h1, h2, h3, h4, h5 {color: var(--emr-dark) !important; letter-spacing: -0.01em;}
+      h1, h2, h3, h4, h5 {color: var(--emr-text) !important; letter-spacing: -0.01em;}
       h3 {font-weight: 700; font-size: 26px;}
       h4 {font-weight: 600; font-size: 20px;}
       h5 {font-weight: 600; font-size: 17px; margin-top: 32px !important; margin-bottom: 8px !important;}
@@ -114,7 +179,54 @@ st.markdown(
       p, span, div {color: var(--emr-text);}
       .stMarkdown p, .stCaption {color: var(--emr-text-muted); font-size: 13.5px; line-height: 1.6;}
 
-      .block-container {padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1480px;}
+      .block-container {
+        padding-top: calc(var(--emr-topbar-h) + 20px) !important; padding-bottom: 3rem; max-width: none;
+        padding-left: calc(var(--emr-sidebar-w) + 40px) !important;
+        padding-right: 40px !important;
+      }
+
+      /* gutter denso — bento */
+      [data-testid="stHorizontalBlock"] {gap: var(--emr-gap) !important;}
+
+      /* === Sidebar (tabs nível 1 viram nav vertical fixa) === */
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] {
+        position: fixed; top: 0; left: 0; bottom: 0;
+        width: var(--emr-sidebar-w);
+        flex-direction: column; align-items: stretch;
+        background: var(--emr-card-bg);
+        border-right: 1px solid var(--emr-line); border-bottom: none;
+        padding: 88px 14px 24px 14px; margin: 0; gap: 6px;
+        z-index: 999; overflow-y: auto;
+      }
+      /* Wordmark EMR no topo da sidebar */
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"]::before {
+        content: "EMR · R1 2026";
+        position: absolute; top: 28px; left: 24px;
+        font-size: 17px; font-weight: 800; letter-spacing: -0.01em;
+        color: var(--emr-text);
+        padding-left: 18px;
+        background: linear-gradient(135deg, #6CE190 0%, #B4F900 100%);
+        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+        border-left: 4px solid var(--emr-lime);
+      }
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab"] {
+        justify-content: flex-start;
+        background: transparent !important; color: var(--emr-text-muted) !important;
+        padding: 12px 16px !important; border-radius: 12px !important;
+        font-weight: 500 !important; font-size: 14px !important;
+        transition: background .15s, color .15s;
+      }
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab"]:hover {
+        background: var(--emr-card-soft) !important; color: var(--emr-text) !important;
+      }
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [aria-selected="true"] {
+        background: var(--emr-lime) !important; color: #264641 !important;
+        font-weight: 700 !important;
+      }
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab-highlight"],
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab-border"] {
+        display: none !important;
+      }
 
       /* === Hero card === */
       .hero-card {
@@ -134,12 +246,12 @@ st.markdown(
       }
       .hero-card .val {
         font-size: 44px; font-weight: 700; line-height: 1.05;
-        color: var(--emr-dark); font-variant-numeric: tabular-nums;
+        color: var(--emr-text); font-variant-numeric: tabular-nums;
         margin-top: 6px; letter-spacing: -0.025em;
       }
       .hero-card .sub {font-size: 12.5px; color: var(--emr-text-muted); margin-top: 8px; line-height: 1.45;}
-      .hero-card .delta-up {color: #1B9F4F; font-weight: 600;}
-      .hero-card .delta-dn {color: var(--emr-orange); font-weight: 600;}
+      .hero-card .delta-up {color: var(--emr-approved); font-weight: 600;}
+      .hero-card .delta-dn {color: var(--emr-red); font-weight: 600;}
       .hero-card .delta-flat {color: var(--emr-text-muted);}
       .hero-card .pill {
         display: inline-block; width: 8px; height: 8px; border-radius: 50%;
@@ -150,12 +262,13 @@ st.markdown(
       .gap-table {width: 100%; border-collapse: separate; border-spacing: 0;
         background: var(--emr-card-bg); border-radius: var(--emr-radius-sm);
         overflow: hidden; box-shadow: var(--emr-shadow);
+        border: 1px solid var(--emr-line);
       }
-      .gap-table td, .gap-table th {padding: 12px 14px; font-size: 13px;}
+      .gap-table td, .gap-table th {padding: 9px 13px; font-size: 12.5px;}
       .gap-table th {
-        background: linear-gradient(180deg, #FBFCFB 0%, #F4F7F5 100%);
-        text-align: left; color: var(--emr-text); font-weight: 600;
-        text-transform: uppercase; letter-spacing: .4px; font-size: 10.5px;
+        background: var(--emr-card-soft);
+        text-align: left; color: var(--emr-text-muted); font-weight: 600;
+        text-transform: uppercase; letter-spacing: .5px; font-size: 10px;
         border-bottom: 1px solid var(--emr-line);
       }
       .gap-table td {
@@ -163,43 +276,50 @@ st.markdown(
         font-variant-numeric: tabular-nums; color: var(--emr-text);
       }
       .gap-table tbody tr:last-child td {border-bottom: none;}
-      .gap-table tbody tr:hover {background: rgba(108, 225, 144, .04);}
-      .gap-table td.dim {font-weight: 600; color: var(--emr-dark);}
+      .gap-table tbody tr:nth-child(even) td {background: rgba(248,248,248,.02);}
+      .gap-table tbody tr:hover td {background: rgba(108, 225, 144, .07);}
+      .gap-table td.dim {font-weight: 600; color: var(--emr-text);}
       .gap-table td.val {text-align: right;}
       .gap-table td.status {text-align: center; font-weight: 600;}
       table {font-variant-numeric: tabular-nums;}
 
-      /* === Tabs === */
-      .stTabs [data-baseweb="tab-list"] {gap: 8px; border-bottom: 1px solid var(--emr-line);
-        background: transparent; padding: 0; margin-bottom: 24px;
+      /* === Tabs internas (nível 2+): pills dark estilo referência === */
+      .stTabs .stTabs [data-baseweb="tab-list"] {gap: 6px; border-bottom: none;
+        background: transparent; padding: 0; margin-bottom: 16px;
       }
-      .stTabs [data-baseweb="tab"] {
-        background: transparent !important; color: var(--emr-text-muted) !important;
-        padding: 10px 18px !important; border-radius: 0 !important;
-        font-weight: 500 !important; font-size: 14px !important;
-        transition: color .15s;
+      .stTabs .stTabs [data-baseweb="tab"] {
+        background: var(--emr-card-bg) !important; color: var(--emr-text-muted) !important;
+        padding: 6px 15px !important; border-radius: 999px !important;
+        border: 1px solid var(--emr-line) !important;
+        font-weight: 500 !important; font-size: 12.5px !important;
+        transition: color .15s, background .15s;
       }
-      .stTabs [data-baseweb="tab"]:hover {color: var(--emr-dark) !important;}
-      .stTabs [aria-selected="true"] {color: var(--emr-dark) !important; font-weight: 700 !important;}
-      .stTabs [data-baseweb="tab-highlight"] {background: var(--emr-gradient) !important; height: 3px !important; border-radius: 2px;}
+      .stTabs .stTabs [data-baseweb="tab"]:hover {color: var(--emr-text) !important; background: var(--emr-card-soft) !important;}
+      .stTabs .stTabs [aria-selected="true"] {
+        color: #264641 !important; font-weight: 700 !important;
+        background: var(--emr-lime) !important; border-color: var(--emr-lime) !important;
+      }
+      .stTabs .stTabs [data-baseweb="tab-highlight"],
+      .stTabs .stTabs [data-baseweb="tab-border"] {display: none !important;}
 
-      /* === Banners (st.info, st.warning, st.caption no header) === */
+      /* === Banners (st.info, st.warning) === */
       [data-testid="stAlert"] {border-radius: var(--emr-radius-sm) !important;
         border: 1px solid var(--emr-line) !important; background: var(--emr-card-bg) !important;
       }
-      [data-testid="stAlert"][kind="info"] {border-left: 4px solid var(--emr-green) !important;}
-      [data-testid="stAlert"][kind="warning"] {border-left: 4px solid #F5B800 !important;}
+      [data-testid="stAlert"][kind="info"] {border-left: 4px solid var(--emr-approved) !important;}
+      [data-testid="stAlert"][kind="warning"] {border-left: 4px solid #FFC805 !important;}
 
       /* === Multiselect / inputs === */
       [data-baseweb="select"] > div {
         border-radius: 10px !important; border-color: var(--emr-line) !important;
         background: var(--emr-card-bg) !important;
       }
-      [data-baseweb="tag"] {background: var(--emr-gradient) !important; color: var(--emr-dark) !important;
+      [data-baseweb="tag"] {background: var(--emr-gradient) !important; color: #264641 !important;
         border-radius: 6px !important; font-weight: 600 !important;
       }
+      [data-baseweb="tag"] span {color: #264641 !important;}
 
-      /* === Header global EMR (banner gradient) === */
+      /* === Header global EMR (banner gradient — CTA lime da referência) === */
       .emr-hero {
         background: var(--emr-gradient);
         border-radius: var(--emr-radius);
@@ -207,15 +327,106 @@ st.markdown(
         margin-bottom: 24px;
         box-shadow: var(--emr-shadow);
       }
-      .emr-hero h3 {color: var(--emr-dark) !important; margin: 0 0 6px 0 !important;
+      .emr-hero h3, .emr-hero p, .emr-hero span, .emr-hero div {color: #264641 !important;}
+      .emr-hero h3 {margin: 0 0 6px 0 !important;
         font-weight: 700; font-size: 30px; letter-spacing: -0.02em;
       }
-      .emr-hero p {color: var(--emr-dark) !important; margin: 0; font-size: 14px; opacity: 0.85;}
+      .emr-hero p {margin: 0; font-size: 14px; opacity: 0.85;}
 
       /* Esconde header e footer padrão do Streamlit pra visual limpo */
       header[data-testid="stHeader"] {background: transparent; height: 0;}
+      [data-testid="stToolbar"], [data-testid="stDecoration"] {display: none !important;}
       footer {visibility: hidden;}
       #MainMenu {visibility: hidden;}
+
+      /* ============================================================
+         BENTO DARK v2026 — topbar, kpi, gauge, donut
+         ============================================================ */
+
+      /* --- TOPBAR fixa --- */
+      .emr-topbar {
+        position: fixed; top: 0; left: var(--emr-sidebar-w); right: 0; height: var(--emr-topbar-h); z-index: 998;
+        display: flex; align-items: center; justify-content: space-between; padding: 0 40px;
+        background: rgba(12,23,18,.82); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+        border-bottom: 1px solid var(--emr-line);
+      }
+      .tb-left {display: flex; align-items: center; gap: 14px;}
+      .tb-logo {display: grid; place-items: center; width: 38px; height: 38px; border-radius: 11px;
+        background: var(--emr-gradient); color: #264641 !important; font-weight: 800; font-size: 15px;
+        letter-spacing: -.02em; box-shadow: 0 2px 12px rgba(108, 225, 144,.28);}
+      .tb-titles {display: flex; flex-direction: column; line-height: 1.15;}
+      .tb-title {font-size: 15px; font-weight: 700; color: var(--emr-text); letter-spacing: -.01em;}
+      .tb-sub {font-size: 11.5px; font-weight: 500; color: var(--emr-text-muted);}
+      .tb-right {display: flex; align-items: center; gap: 16px;}
+      .tb-chip {display: inline-flex; align-items: center; gap: 7px; padding: 6px 13px; border-radius: 999px;
+        background: var(--emr-card-bg); border: 1px solid var(--emr-line); font-size: 12px; font-weight: 600; color: var(--emr-text);}
+      .tb-chip--live i {width: 7px; height: 7px; border-radius: 50%; background: var(--emr-approved); box-shadow: 0 0 0 3px rgba(108, 225, 144,.18);}
+      .tb-snap {font-size: 12.5px; color: var(--emr-text-muted);}
+      .tb-snap strong {color: var(--emr-text); font-weight: 600;}
+
+      /* --- SIDEBAR: ícones nos 4 itens de nível 1 --- */
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab"] {
+        display: flex; align-items: center; gap: 11px;
+      }
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab"]::before {
+        font-size: 16px; line-height: 1; width: 20px; text-align: center; filter: grayscale(.15); opacity: .9;
+      }
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab"]:nth-child(1)::before {content: "📊";}
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab"]:nth-child(2)::before {content: "🏥";}
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab"]:nth-child(3)::before {content: "📈";}
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab"]:nth-child(4)::before {content: "🎯";}
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [aria-selected="true"]::before {filter: none; opacity: 1;}
+
+      /* --- KPI card (novo, coexiste com .hero-card legado) --- */
+      .kpi {background: var(--emr-card-bg); border: 1px solid var(--emr-line); border-radius: var(--emr-radius);
+        padding: 20px 22px; height: 100%; box-shadow: var(--emr-shadow);
+        transition: box-shadow .2s, transform .15s, border-color .2s;
+        display: flex; align-items: flex-start; justify-content: space-between; gap: 14px;}
+      .kpi:hover {box-shadow: var(--emr-shadow-hover); transform: translateY(-1px); border-color: rgba(108, 225, 144,.22);}
+      .kpi-main {min-width: 0;}
+      .kpi-col {flex-direction: column; align-items: stretch;}
+      .kpi-eyebrow {font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px;
+        color: var(--emr-text-muted); font-weight: 600; display: flex; align-items: center;}
+      .kpi-eyebrow .dot {width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; flex: 0 0 8px;}
+      .kpi-val {font-size: 40px; font-weight: 700; line-height: 1; color: var(--emr-text);
+        font-variant-numeric: tabular-nums; margin-top: 8px; letter-spacing: -.025em;}
+      .kpi-val span {font-size: 15px; font-weight: 600; color: var(--emr-text-muted);}
+      .kpi-sub {font-size: 12.5px; color: var(--emr-text-muted); margin-top: 8px; line-height: 1.4;}
+
+      /* anel radial (conic-gradient) */
+      .gauge {position: relative; width: 74px; height: 74px; flex: 0 0 74px;}
+      .gauge .ring {width: 100%; height: 100%; border-radius: 50%;
+        background: conic-gradient(var(--fill) calc(var(--p) * 1%), var(--emr-track) 0);
+        -webkit-mask: radial-gradient(farthest-side, #0000 calc(100% - 9px), #000 calc(100% - 8px));
+                mask: radial-gradient(farthest-side, #0000 calc(100% - 9px), #000 calc(100% - 8px));}
+      .gauge .gnum {position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+        font-size: 18px; font-weight: 700; color: var(--emr-text); font-variant-numeric: tabular-nums; white-space: nowrap;}
+      .gauge .gnum span {font-size: 11px; font-weight: 600; color: var(--emr-text-muted); margin-left: 1px;}
+
+      /* barra de progresso */
+      .pbar {height: 6px; border-radius: 999px; background: var(--emr-track); overflow: hidden; margin: 12px 0 0;}
+      .pbar > i {display: block; height: 100%; border-radius: 999px; width: calc(var(--p) * 1%); background: var(--fill); transition: width .4s;}
+
+      /* delta chip */
+      .chip-delta {display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600;
+        padding: 3px 9px; border-radius: 999px; margin-top: 10px;}
+      .chip-delta.up {color: var(--emr-approved); background: rgba(108, 225, 144,.12);}
+      .chip-delta.dn {color: var(--emr-red); background: rgba(255,81,77,.12);}
+      .chip-delta.flat {color: var(--emr-text-muted); background: rgba(248,248,248,.06);}
+
+      /* --- DONUT de faixas --- */
+      .donut-card {background: var(--emr-card-bg); border: 1px solid var(--emr-line); border-radius: var(--emr-radius);
+        padding: 20px; height: 100%; box-shadow: var(--emr-shadow);
+        display: flex; flex-direction: column; align-items: center; gap: 16px;}
+      .donut {position: relative; width: 132px; height: 132px; border-radius: 50%;}
+      .donut-hole {position: absolute; inset: 15px; border-radius: 50%; background: var(--emr-card-bg);
+        display: grid; place-items: center; align-content: center;}
+      .donut-big {font-size: 26px; font-weight: 700; color: var(--emr-text); line-height: 1;}
+      .donut-cap {font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: .6px; color: var(--emr-text-muted); margin-top: 3px;}
+      .donut-legend {list-style: none; margin: 0; padding: 0; width: 100%;}
+      .donut-legend li {display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--emr-text-muted); padding: 4px 0;}
+      .donut-legend li span {width: 9px; height: 9px; border-radius: 3px; flex: 0 0 9px;}
+      .donut-legend li b {margin-left: auto; color: var(--emr-text); font-weight: 600; font-variant-numeric: tabular-nums;}
 
     </style>
     """,
@@ -301,10 +512,10 @@ def assign_safra(first_start: pd.Series) -> pd.Series:
 
 PRESCRIPTION_CLASSES = ["Excelência", "Proficiência", "Abaixo do canal", "Sem acerto canônico"]
 PRESCRIPTION_COLORS = {
-    "Excelência":          "#6CE190",  # Residente Green (v2026)
-    "Proficiência":        "#1B9F4F",  # Verde mais escuro pra contraste no mesmo eixo
-    "Abaixo do canal":     "#FF514D",  # Residente Orange
-    "Sem acerto canônico": "#C9D2CD",  # Cinza neutro v2026
+    "Excelência":          "#6CE190",  # Residente Approved — "aprovação · resultado"
+    "Proficiência":        "#009B3F",  # complementar verde — mesmo eixo, patamar abaixo
+    "Abaixo do canal":     "#FF514D",  # complementar vermelha — alerta
+    "Sem acerto canônico": "#8FA39D",  # neutro derivado — ausência de dado, não julgamento
 }
 PRESCRIPTION_MEANING = {
     "Excelência":          "acertou ≥ alvo Excelência no mock do mês",
@@ -672,8 +883,18 @@ fresh_date, fresh_truncated = data_freshness()
 fresh_txt = f"Dados até {fresh_date:%d/%m/%Y}" if fresh_date else "Dados indisponíveis"
 st.markdown(
     f"""
-    <div class="emr-hero">
-      <h3>Dashboard Ensino e Produto EMR</h3>
+    <div class="emr-topbar">
+      <div class="tb-left">
+        <span class="tb-logo">EMR</span>
+        <div class="tb-titles">
+          <span class="tb-title">Dashboard Ensino &amp; Produto</span>
+          <span class="tb-sub">Cohort R1 2026</span>
+        </div>
+      </div>
+      <div class="tb-right">
+        <span class="tb-chip tb-chip--live"><i></i>{fresh_txt}</span>
+        <span class="tb-snap">Snapshot&nbsp;<strong>{snapshot_date:%d/%m %H:%M}</strong></span>
+      </div>
     </div>
     """,
     unsafe_allow_html=True,
@@ -1235,8 +1456,8 @@ def _compute_status_geral(df_: pd.DataFrame, cohort_: pd.DataFrame, last_closed_
     """Calcula 4 indicadores de status do cohort em 2026:
 
     - **Pagantes**: tamanho do cohort (inscrição válida — já filtrado upstream).
-    - **Ativos**: alunos com `dias_ativos > 0` em alguma semana cujo início é
-      ≥ (hoje - 15 dias). Reflete "entraram na plataforma nos últimos 15 dias".
+    - **Ativos**: alunos com `dias_ativos > 0` na última semana ISO fechada.
+      `dias_ativos` = qualquer atividade (questão, aula/bloco ≥50%, flashcard).
     - **Engajados**: média semanal ≥25 questões E ≥8 blocos desde a primeira
       semana ativa do aluno em 2026 até a última semana fechada.
     - **Meta mínima**: média semanal ≥70 questões na mesma janela.
@@ -1244,11 +1465,12 @@ def _compute_status_geral(df_: pd.DataFrame, cohort_: pd.DataFrame, last_closed_
     cohort_ids = cohort_["account_id"]
     n_pagantes = len(cohort_)
 
-    # --- Ativos últimos 15 dias ---
-    cutoff_15d = pd.Timestamp(date.today()) - pd.Timedelta(days=15)
-    recent = df_[(df_["semana_iso"] >= cutoff_15d) & (df_["dias_ativos"] > 0)]
+    # --- Ativos na última semana ISO fechada ---
+    _hoje = pd.Timestamp(date.today())
+    _full_monday = _hoje - pd.Timedelta(days=int(_hoje.weekday()) + 7)
+    recent = df_[(df_["semana_iso"] == _full_monday) & (df_["dias_ativos"] > 0)]
     recent = recent[recent["account_id"].isin(cohort_ids)]
-    n_ativos_15d = int(recent["account_id"].nunique())
+    n_ativos_semana = int(recent["account_id"].nunique())
 
     # --- Engajados / meta mínima (lógica anterior) ---
     week_start = pd.Timestamp("2026-01-05")
@@ -1259,7 +1481,7 @@ def _compute_status_geral(df_: pd.DataFrame, cohort_: pd.DataFrame, last_closed_
     sub = df_[(df_["semana_iso"] >= week_start) & (df_["semana_iso"] <= last_monday)]
     sub = sub[sub["account_id"].isin(cohort_ids)]
     if sub.empty:
-        return {"n_pagantes": n_pagantes, "n_ativos_15d": n_ativos_15d,
+        return {"n_pagantes": n_pagantes, "n_ativos_semana": n_ativos_semana,
                 "n_engajados": 0, "n_meta_min": 0}
 
     first_active = (
@@ -1268,7 +1490,7 @@ def _compute_status_geral(df_: pd.DataFrame, cohort_: pd.DataFrame, last_closed_
         .rename("first_active_week").reset_index()
     )
     if first_active.empty:
-        return {"n_pagantes": n_pagantes, "n_ativos_15d": n_ativos_15d,
+        return {"n_pagantes": n_pagantes, "n_ativos_semana": n_ativos_semana,
                 "n_engajados": 0, "n_meta_min": 0}
 
     joined = sub.merge(first_active, on="account_id", how="inner")
@@ -1286,15 +1508,15 @@ def _compute_status_geral(df_: pd.DataFrame, cohort_: pd.DataFrame, last_closed_
 
     n_engajados = int(((by_aluno["mean_q_wk"] >= 25) & (by_aluno["mean_b_wk"] >= 8)).sum())
     n_meta_min = int((by_aluno["mean_q_wk"] >= 70).sum())
-    return {"n_pagantes": n_pagantes, "n_ativos_15d": n_ativos_15d,
+    return {"n_pagantes": n_pagantes, "n_ativos_semana": n_ativos_semana,
             "n_engajados": n_engajados, "n_meta_min": n_meta_min}
 
 
 def _render_agora_now(key_prefix: str = "agora"):
-    # --- Status geral: pagantes, ativos (15d), engajados, meta mínima ---
+    # --- Status geral: pagantes, ativos (última semana fechada), engajados, meta mínima ---
     _status = _compute_status_geral(df, cohort, last_closed)
     _stat_pagantes = _status["n_pagantes"]
-    _stat_ativos = _status["n_ativos_15d"]
+    _stat_ativos = _status["n_ativos_semana"]
     _stat_engaj = _status["n_engajados"]
     _stat_meta = _status["n_meta_min"]
     _denom = _stat_pagantes if _stat_pagantes else 1
@@ -1305,36 +1527,122 @@ def _render_agora_now(key_prefix: str = "agora"):
     st.markdown("&nbsp;")
     sg1, sg2, sg3, sg4 = st.columns(4)
     sg1.markdown(
-        f"""<div class="hero-card">
-          <div class="lbl"><span class="pill" style="background:#32578A"></span>Pagantes</div>
-          <div class="val">{_stat_pagantes:,}</div>
-          <div class="sub">inscrição ativa</div>
+        f"""<div class="kpi">
+          <div class="kpi-main">
+            <div class="kpi-eyebrow"><span class="dot" style="background:var(--emr-green-deep)"></span>Pagantes</div>
+            <div class="kpi-val">{_stat_pagantes:,}</div>
+            <div class="kpi-sub">inscrição ativa</div>
+          </div>
         </div>""",
         unsafe_allow_html=True,
     )
-    sg2.markdown(
-        f"""<div class="hero-card">
-          <div class="lbl"><span class="pill" style="background:#841A81"></span>Ativos</div>
-          <div class="val">{_stat_ativos:,} <span style="font-size:14px;color:#71717a">({_pct_ativos:.0f}%)</span></div>
-          <div class="sub">acessaram nos últimos 15 dias</div>
+    for _col, _lbl, _n, _pct, _fill, _sub in (
+        (sg2, "Ativos", _stat_ativos, _pct_ativos, "var(--emr-approved)",
+         "≥1 atividade (aula, questão ou flashcard) na última semana fechada"),
+        (sg3, "Meta mínima", _stat_meta, _pct_meta, "var(--emr-lime)",
+         "≥70 questões/semana (média)"),
+        (sg4, "Engajados", _stat_engaj, _pct_engaj, "var(--emr-yellow)",
+         "≥25 questões + ≥8 blocos/semana (média)"),
+    ):
+        _col.markdown(
+            f"""<div class="kpi">
+              <div class="kpi-main">
+                <div class="kpi-eyebrow"><span class="dot" style="background:{_fill}"></span>{_lbl}</div>
+                <div class="kpi-val">{_n:,}</div>
+                <div class="kpi-sub">{_sub}</div>
+              </div>
+              <div class="gauge" style="--p:{_pct:.1f}; --fill:{_fill}">
+                <div class="ring"></div>
+                <div class="gnum">{_pct:.0f}<span>%</span></div>
+              </div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+
+    # --- Distribuição de faixas: donut + cards com barra de progresso ---
+    # (Janela fixa: último mês fechado, com Δ vs mês anterior.)
+    cur_per = aggregate_month(df, last_closed)
+    prev_per = aggregate_month(df, prev_closed) if prev_closed else None
+    cur_targets = PRESCRIPTION_TARGETS[last_closed]
+    cur_mes = last_closed
+    cur_mes_label = PRESCRIPTION_MONTHLY[last_closed]["label"]
+    prev_mes_label = PRESCRIPTION_MONTHLY[prev_closed]["label"] if prev_closed else None
+
+    cur_counts = faixa_counts(cur_per)
+    prev_counts = faixa_counts(prev_per) if prev_per is not None else None
+
+    st.markdown("&nbsp;")
+    _ch = PRESCRIPTION_MONTHLY[cur_mes]
+    _meaning_dyn = {
+        "Excelência":          f"acertou ≥{_ch['excel_min']}% no mock de {cur_mes_label}",
+        "Proficiência":        f"acertou {_ch['prof_min']}–{_ch['excel_min']-1}% no mock de {cur_mes_label}",
+        "Abaixo do canal":     f"acertou <{_ch['prof_min']}% no mock de {cur_mes_label}",
+        "Sem acerto canônico": f"não fez mock canônico em {cur_mes_label}",
+    }
+    _pcts = {f: cur_counts[f] / total * 100 for f in PRESCRIPTION_CLASSES}
+    _c1 = _pcts["Excelência"]
+    _c2 = _c1 + _pcts["Proficiência"]
+    _c3 = _c2 + _pcts["Abaixo do canal"]
+    _donut_grad = (
+        f"conic-gradient("
+        f"var(--emr-approved) 0 {_c1:.1f}%, "
+        f"var(--emr-green-deep) {_c1:.1f}% {_c2:.1f}%, "
+        f"var(--emr-red) {_c2:.1f}% {_c3:.1f}%, "
+        f"var(--emr-neutral) {_c3:.1f}% 100%)"
+    )
+    _legend_items = "".join(
+        f'<li><span style="background:{PRESCRIPTION_COLORS[f]}"></span>{f}'
+        f'<b>{_pcts[f]:.0f}% · {cur_counts[f]:,}</b></li>'
+        for f in PRESCRIPTION_CLASSES
+    )
+    dcol, *fcols = st.columns([1.15, 1, 1, 1])
+    dcol.markdown(
+        f"""<div class="donut-card">
+          <div class="donut" style="background:{_donut_grad}">
+            <div class="donut-hole">
+              <div class="donut-big">{_pcts['Excelência']:.0f}%</div>
+              <div class="donut-cap">Excelência</div>
+            </div>
+          </div>
+          <ul class="donut-legend">{_legend_items}</ul>
         </div>""",
         unsafe_allow_html=True,
     )
-    sg3.markdown(
-        f"""<div class="hero-card">
-          <div class="lbl"><span class="pill" style="background:#05FC89"></span>Meta mínima</div>
-          <div class="val">{_stat_meta:,} <span style="font-size:14px;color:#71717a">({_pct_meta:.0f}%)</span></div>
-          <div class="sub">≥70 questões/semana (média)</div>
-        </div>""",
-        unsafe_allow_html=True,
-    )
-    sg4.markdown(
-        f"""<div class="hero-card">
-          <div class="lbl"><span class="pill" style="background:#EAB904"></span>Engajados</div>
-          <div class="val">{_stat_engaj:,} <span style="font-size:14px;color:#71717a">({_pct_engaj:.0f}%)</span></div>
-          <div class="sub">≥25 questões + ≥8 blocos/semana (média)</div>
-        </div>""",
-        unsafe_allow_html=True,
+    for _fcol, faixa in zip(fcols, PRESCRIPTION_CLASSES[:3]):
+        n_cur = cur_counts[faixa]
+        pct_cur = _pcts[faixa]
+        color = PRESCRIPTION_COLORS[faixa]
+        meaning = _meaning_dyn[faixa]
+
+        if prev_counts is not None:
+            n_prev = prev_counts[faixa]
+            pct_prev = n_prev / total * 100
+            delta_pp = pct_cur - pct_prev
+            if abs(delta_pp) < 0.5:
+                delta_html = f'<span class="chip-delta flat">≈ vs {prev_mes_label}</span>'
+            elif delta_pp > 0:
+                cls = "up" if faixa in ("Excelência", "Proficiência") else "dn"
+                delta_html = f'<span class="chip-delta {cls}">+{delta_pp:.1f}pp vs {prev_mes_label}</span>'
+            else:
+                cls = "dn" if faixa in ("Excelência", "Proficiência") else "up"
+                delta_html = f'<span class="chip-delta {cls}">{delta_pp:.1f}pp vs {prev_mes_label}</span>'
+        else:
+            delta_html = '<span class="chip-delta flat">—</span>'
+
+        _fcol.markdown(
+            f"""<div class="kpi kpi-col">
+              <div class="kpi-eyebrow"><span class="dot" style="background:{color}"></span>{faixa}</div>
+              <div class="kpi-val">{pct_cur:.0f}<span>%</span></div>
+              <div class="pbar" style="--p:{pct_cur:.1f}; --fill:{color}"><i></i></div>
+              <div class="kpi-sub">{n_cur:,} de {total:,} · {meaning}</div>
+              <div>{delta_html}</div>
+            </div>""",
+            unsafe_allow_html=True,
+        )
+    st.caption(
+        f"Alvos {cur_mes_label}: Proficiência ≥{_ch['prof_min']}% · "
+        f"Excelência ≥{_ch['excel_min']}% de acerto no mock. "
+        f"Sem acerto canônico: {_meaning_dyn['Sem acerto canônico']}."
     )
 
     # --- Questões por aluno/semana: média e mediana do grupo filtrado.
@@ -1360,81 +1668,23 @@ def _render_agora_now(key_prefix: str = "agora"):
         st.markdown("&nbsp;")
         qc1, qc2, qc3, qc4 = st.columns(4)
         for _col, _dados, _tit, _monday, _cor in (
-            (qc1, _q_full, "Questões/aluno — média", _full_monday, "#32578A"),
-            (qc2, _q_full, "Questões/aluno — mediana", _full_monday, "#32578A"),
-            (qc3, _q_part, "Média (semana parcial)", _cur_monday, "#71717a"),
-            (qc4, _q_part, "Mediana (semana parcial)", _cur_monday, "#71717a"),
+            (qc1, _q_full, "Questões/aluno — média", _full_monday, "var(--emr-approved)"),
+            (qc2, _q_full, "Questões/aluno — mediana", _full_monday, "var(--emr-approved)"),
+            (qc3, _q_part, "Média (semana parcial)", _cur_monday, "var(--emr-text-muted)"),
+            (qc4, _q_part, "Mediana (semana parcial)", _cur_monday, "var(--emr-text-muted)"),
         ):
             if _dados is None:
                 continue
             _val = _dados[0] if "média" in _tit.lower() else _dados[1]
             _col.markdown(
-                f"""<div class="hero-card">
-                  <div class="lbl"><span class="pill" style="background:{_cor}"></span>{_tit}</div>
-                  <div class="val">{_val:.1f}</div>
-                  <div class="sub">semana {_rng_semana(_monday)} · zeros incluídos</div>
+                f"""<div class="kpi kpi-col">
+                  <div class="kpi-eyebrow"><span class="dot" style="background:{_cor}"></span>{_tit}</div>
+                  <div class="kpi-val">{_val:.1f}</div>
+                  <div class="kpi-sub">semana {_rng_semana(_monday)} · zeros incluídos</div>
                 </div>""",
                 unsafe_allow_html=True,
             )
 
-    # Janela fixa: último mês fechado, com Δ vs mês anterior nos cards.
-    cur_per = aggregate_month(df, last_closed)
-    prev_per = aggregate_month(df, prev_closed) if prev_closed else None
-    cur_targets = PRESCRIPTION_TARGETS[last_closed]
-    cur_mes = last_closed
-    cur_mes_label = PRESCRIPTION_MONTHLY[last_closed]["label"]
-    prev_mes_label = PRESCRIPTION_MONTHLY[prev_closed]["label"] if prev_closed else None
-
-    # --- Bloco 1: hero cards ---
-    cur_counts = faixa_counts(cur_per)
-    prev_counts = faixa_counts(prev_per) if prev_per is not None else None
-
-    st.markdown("&nbsp;")
-    cols = st.columns(4)
-    # Critério dinâmico por faixa baseado no alvo do mês de referência.
-    _ch = PRESCRIPTION_MONTHLY[cur_mes]
-    _meaning_dyn = {
-        "Excelência":          f"acertou ≥{_ch['excel_min']}% no mock de {cur_mes_label}",
-        "Proficiência":        f"acertou {_ch['prof_min']}–{_ch['excel_min']-1}% no mock de {cur_mes_label}",
-        "Abaixo do canal":     f"acertou <{_ch['prof_min']}% no mock de {cur_mes_label}",
-        "Sem acerto canônico": f"não fez mock canônico em {cur_mes_label}",
-    }
-    for i, faixa in enumerate(PRESCRIPTION_CLASSES):
-        n_cur = cur_counts[faixa]
-        pct_cur = n_cur / total * 100
-        color = PRESCRIPTION_COLORS[faixa]
-        meaning = _meaning_dyn[faixa]
-
-        if prev_counts is not None:
-            n_prev = prev_counts[faixa]
-            pct_prev = n_prev / total * 100
-            delta_pp = pct_cur - pct_prev
-            if abs(delta_pp) < 0.5:
-                delta_html = f'<span class="delta-flat">≈ vs {prev_mes_label}</span>'
-            elif delta_pp > 0:
-                cls = "delta-up" if faixa in ("Excelência", "Proficiência") else "delta-dn"
-                delta_html = f'<span class="{cls}">+{delta_pp:.1f}pp vs {prev_mes_label}</span>'
-            else:
-                cls = "delta-dn" if faixa in ("Excelência", "Proficiência") else "delta-up"
-                delta_html = f'<span class="{cls}">{delta_pp:.1f}pp vs {prev_mes_label}</span>'
-        else:
-            delta_html = '<span class="delta-flat">—</span>'
-
-        cols[i].markdown(
-            f"""<div class="hero-card">
-              <div class="lbl"><span class="pill" style="background:{color}"></span>{faixa}</div>
-              <div class="val">{pct_cur:.0f}%</div>
-              <div class="sub">{n_cur:,} de {total:,} alunos · {meaning}</div>
-              <div class="sub" style="margin-top:8px">{delta_html}</div>
-            </div>""",
-            unsafe_allow_html=True,
-        )
-
-    _ch = PRESCRIPTION_MONTHLY[cur_mes]
-    st.caption(
-        f"Alvos {cur_mes_label}: Proficiência ≥{_ch['prof_min']}% · "
-        f"Excelência ≥{_ch['excel_min']}% de acerto no mock."
-    )
     # --- Bloco 1b: Volume por faixa (média e mediana) ---
     # Mostra quanto de questões/flashcards/blocos cada faixa consumiu no mês.
     # Alunos sem atividade entram com 0 — puxa a mediana de "Sem acerto canônico"
@@ -1470,13 +1720,13 @@ def _render_agora_now(key_prefix: str = "agora"):
             f"<th style='text-align:right'>"
             f"<span class='pill' style='background:{PRESCRIPTION_COLORS[f]};display:inline-block;"
             f"width:8px;height:8px;border-radius:50%;margin-right:6px'></span>{f}"
-            f"<br><span style='font-size:11px;color:#B8B8B8;font-weight:400'>n={cur_counts[f]:,}</span>"
+            f"<br><span style='font-size:11px;color:#93A8A2;font-weight:400'>n={cur_counts[f]:,}</span>"
             f"</th>"
             for f in PRESCRIPTION_CLASSES
         )
         header_cells += (
             f"<th style='text-align:right'>Turma toda"
-            f"<br><span style='font-size:11px;color:#B8B8B8;font-weight:400'>n={total:,}</span></th>"
+            f"<br><span style='font-size:11px;color:#93A8A2;font-weight:400'>n={total:,}</span></th>"
         )
         return (
             f"<table class='gap-table'>"
@@ -1534,13 +1784,13 @@ def _render_agora_now(key_prefix: str = "agora"):
             f"<th style='text-align:right'>"
             f"<span class='pill' style='background:{PRESCRIPTION_COLORS[f]};display:inline-block;"
             f"width:8px;height:8px;border-radius:50%;margin-right:6px'></span>{f}"
-            f"<br><span style='font-size:11px;color:#B8B8B8;font-weight:400'>n={cur_counts[f]:,}</span>"
+            f"<br><span style='font-size:11px;color:#93A8A2;font-weight:400'>n={cur_counts[f]:,}</span>"
             f"</th>"
             for f in PRESCRIPTION_CLASSES
         )
         header_cells += (
             f"<th style='text-align:right'>Turma toda"
-            f"<br><span style='font-size:11px;color:#B8B8B8;font-weight:400'>n={total:,}</span></th>"
+            f"<br><span style='font-size:11px;color:#93A8A2;font-weight:400'>n={total:,}</span></th>"
         )
         return (
             f"<table class='gap-table'>"
@@ -1590,15 +1840,15 @@ def _render_agora_now(key_prefix: str = "agora"):
         opacity=0.85,
     )
     ref = PRESCRIPTION_MONTHLY[cur_mes]
-    fig.add_hline(y=ref["prof_min"], line_dash="dot", line_color="#32578A",
+    fig.add_hline(y=ref["prof_min"], line_dash="dot", line_color="#50BCFF",
                   annotation_text=f"P25 Proficiência {ref['label']} ({ref['prof_min']}%)",
                   annotation_position="bottom right")
-    fig.add_hline(y=ref["excel_min"], line_dash="dot", line_color="#05FC89",
+    fig.add_hline(y=ref["excel_min"], line_dash="dot", line_color="#6CE190",
                   annotation_text=f"P25 Excelência {ref['label']} ({ref['excel_min']}%)",
                   annotation_position="top right")
     fig.update_layout(
-        height=460,
-        plot_bgcolor="#fff", paper_bgcolor="#fff",
+        height=360,
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=10, r=10, t=10, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=-0.22),
     )
@@ -1739,8 +1989,8 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
                 if sub.empty:
                     rows_html.append(
                         f"<tr><td class='dim'>{ed['nome']}</td>"
-                        f"<td class='val' style='color:#71717a'>{ed['data']}</td>"
-                        f"<td class='val' style='color:#B8B8B8' colspan='4'>sem participação</td></tr>"
+                        f"<td class='val' style='color:#93A8A2'>{ed['data']}</td>"
+                        f"<td class='val' style='color:#93A8A2' colspan='4'>sem participação</td></tr>"
                     )
                     continue
                 n = len(sub)
@@ -1748,12 +1998,12 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
                 media = float(sub["pct"].mean())
                 mediana = float(sub["pct"].median())
                 pct_60 = float((sub["pct"] >= 60).mean()) * 100
-                cor60 = "#04A36A" if pct_60 >= 60 else ("#EAB904" if pct_60 >= 40 else "#E64444")
+                cor60 = "#6CE190" if pct_60 >= 60 else ("#FFC805" if pct_60 >= 40 else "#FF514D")
                 rows_html.append(
                     f"<tr>"
                     f"<td class='dim'>{ed['nome']}</td>"
-                    f"<td class='val' style='color:#71717a'>{ed['data']}</td>"
-                    f"<td class='val'>{n:,}<br><span style='font-size:11px;color:#71717a'>{cov:.0f}% do grupo</span></td>"
+                    f"<td class='val' style='color:#93A8A2'>{ed['data']}</td>"
+                    f"<td class='val'>{n:,}<br><span style='font-size:11px;color:#93A8A2'>{cov:.0f}% do grupo</span></td>"
                     f"<td class='val'>{media:.1f}%</td>"
                     f"<td class='val'>{mediana:.1f}%</td>"
                     f"<td class='val' style='color:{cor60};font-weight:600'>{pct_60:.1f}%</td>"
@@ -2345,7 +2595,7 @@ with tab_evolucao:
     else:
         _evo_label = f"{len(_evo_turmas)} turmas selecionadas"
     st.markdown(
-        f"<div style='margin-top:-8px;margin-bottom:14px;color:#71717a;font-size:13px'>"
+        f"<div style='margin-top:-8px;margin-bottom:14px;color:#93A8A2;font-size:13px'>"
         f"<b>{_evo_label}</b> · {_evo_total:,} alunos</div>",
         unsafe_allow_html=True,
     )
@@ -2373,7 +2623,7 @@ with tab_evolucao:
             hovertemplate=f"<b>{f}</b><br>%{{y:.1f}}%<extra></extra>",
         ))
     fig_area.update_layout(
-        height=380, plot_bgcolor="#fff", paper_bgcolor="#fff",
+        height=300, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=10, r=10, t=10, b=10),
         yaxis=dict(title="% da turma", ticksuffix="%", range=[0, 100]),
         xaxis=dict(title="Mês"),
@@ -2392,43 +2642,43 @@ with tab_evolucao:
     # Bandas (canais) — desenha cada uma como duas linhas com fill='tonexty'
     fig_line.add_trace(go.Scatter(
         x=ac_df["mes_label"], y=ac_df["excel_max"], mode="lines",
-        line=dict(width=0, color="#05FC89"), showlegend=False, hoverinfo="skip",
+        line=dict(width=0, color="#6CE190"), showlegend=False, hoverinfo="skip",
     ))
     fig_line.add_trace(go.Scatter(
         x=ac_df["mes_label"], y=ac_df["excel_min"], mode="lines",
-        line=dict(width=0, color="#05FC89"),
+        line=dict(width=0, color="#6CE190"),
         fill="tonexty", fillcolor="rgba(5,252,137,.55)",
         name="Canal Excelência v2 (editorial)", hovertemplate="Excel %{y:.0f}%–<extra></extra>",
     ))
     fig_line.add_trace(go.Scatter(
         x=ac_df["mes_label"], y=ac_df["prof_max"], mode="lines",
-        line=dict(width=0, color="#32578A"), showlegend=False, hoverinfo="skip",
+        line=dict(width=0, color="#50BCFF"), showlegend=False, hoverinfo="skip",
     ))
     fig_line.add_trace(go.Scatter(
         x=ac_df["mes_label"], y=ac_df["prof_min"], mode="lines",
-        line=dict(width=0, color="#32578A"),
+        line=dict(width=0, color="#50BCFF"),
         fill="tonexty", fillcolor="rgba(50,87,138,.50)",
         name="Canal Proficiência v1 (2025; v2-Profic pendente)",
     ))
     fig_line.add_trace(go.Scatter(
         x=ac_df["mes_label"], y=ac_df["mediana_turma"],
         mode="lines+markers+text",
-        line=dict(color="#181717", width=3),
-        marker=dict(size=9, color="#181717"),
+        line=dict(color="#F8F8F8", width=3),
+        marker=dict(size=9, color="#F8F8F8"),
         name="Mediana turma R1 2026",
         text=[
             f"n={n}/{_evo_total}<br>({n/_evo_total*100:.0f}%)"
             for n in ac_df["n_com_mock"]
         ],
         textposition="top center",
-        textfont=dict(size=10, color="#181717"),
+        textfont=dict(size=10, color="#F8F8F8"),
         hovertemplate=(
             "<b>Mediana turma</b>: %{y:.1f}%<br>"
             "%{text}<extra></extra>"
         ),
     ))
     fig_line.update_layout(
-        height=420, plot_bgcolor="#fff", paper_bgcolor="#fff",
+        height=340, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=10, r=10, t=10, b=10),
         yaxis=dict(title="% acerto canônico", ticksuffix="%", range=[20, 90]),
         xaxis=dict(title="Mês"),
@@ -2465,7 +2715,7 @@ with tab_evolucao:
             hovertemplate="Safra %{x}<br>%{y:.1f}% em Proficiência<extra></extra>",
         ))
         fig_safra.update_layout(
-            height=380, plot_bgcolor="#fff", paper_bgcolor="#fff",
+            height=300, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             margin=dict(l=10, r=10, t=30, b=10),
             barmode="group",
             yaxis=dict(title="% da safra", ticksuffix="%"),
@@ -2515,7 +2765,7 @@ with tab_evolucao:
             ),
         ))
         fig_vol.update_layout(
-            height=380, plot_bgcolor="#fff", paper_bgcolor="#fff",
+            height=300, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             margin=dict(l=10, r=10, t=30, b=10),
             barmode="group",
             yaxis=dict(title="% da safra", ticksuffix="%"),
@@ -2626,7 +2876,7 @@ with tab_evolucao:
             labels={"semana_iso": "Semana ISO (segunda)", "valor": "Valor"},
         )
         fig.update_layout(
-            height=420, plot_bgcolor="#fff", paper_bgcolor="#fff",
+            height=340, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             margin=dict(l=10, r=10, t=10, b=10),
             legend=dict(orientation="h", yanchor="bottom", y=-0.25),
         )
@@ -2706,7 +2956,7 @@ with tab_qualidade:
         if d.empty:
             return (
                 f"<tr><td class='dim'>{label}</td>"
-                f"<td class='val' style='color:#B8B8B8' colspan='6'>sem avaliações no mês</td></tr>"
+                f"<td class='val' style='color:#93A8A2' colspan='6'>sem avaliações no mês</td></tr>"
             )
         # Geral primeiro
         geral_avg = float(d["rate"].mean())
@@ -2728,24 +2978,24 @@ with tab_qualidade:
             )
         # Geral
         cells.append(
-            f"<td class='val' style='font-weight:600;background:#FFFAE0'>"
-            f"<span style='font-size:18px;color:#181717'>★ {geral_avg:.2f}</span>"
-            f"<br><span style='font-size:11px;color:#71717a'>n={geral_n:,} · {geral_alunos:,} alunos</span></td>"
+            f"<td class='val' style='font-weight:600;background:#264641'>"
+            f"<span style='font-size:18px;color:#264641'>★ {geral_avg:.2f}</span>"
+            f"<br><span style='font-size:11px;color:#93A8A2'>n={geral_n:,} · {geral_alunos:,} alunos</span></td>"
         )
         for sigla, bid in BIG_AREAS_ORDER:
             info = por_area.get(bid)
             if info is None:
                 cells.append(
-                    f"<td class='val' style='color:#B8B8B8'>—<br><span style='font-size:11px'>sem dados</span></td>"
+                    f"<td class='val' style='color:#93A8A2'>—<br><span style='font-size:11px'>sem dados</span></td>"
                 )
             else:
                 # Cor sutil: 4.5+ verde, 4.0-4.5 amarelo, <4 vermelho
-                cor = "#04A36A" if info["avg"] >= 4.5 else ("#EAB904" if info["avg"] >= 4.0 else "#E64444")
+                cor = "#6CE190" if info["avg"] >= 4.5 else ("#FFC805" if info["avg"] >= 4.0 else "#FF514D")
                 extra = f" · {info['n_alunos']:,} alunos" if alunos_area else ""
                 cells.append(
                     f"<td class='val'>"
                     f"<span style='font-size:16px;color:{cor};font-weight:600'>★ {info['avg']:.2f}</span>"
-                    f"<br><span style='font-size:11px;color:#71717a'>n={info['n']:,}{extra}</span></td>"
+                    f"<br><span style='font-size:11px;color:#93A8A2'>n={info['n']:,}{extra}</span></td>"
                 )
         return (
             f"<tr><td class='dim'>{_label_html}</td>{''.join(cells)}</tr>"
@@ -2754,7 +3004,7 @@ with tab_qualidade:
     # Header da tabela combinada
     sigla_to_nome = {sigla: BIG_AREAS_NOMES[bid] for sigla, bid in BIG_AREAS_ORDER}
     header_cols = (
-        "<th style='text-align:right;background:#FFFAE0'>Geral</th>"
+        "<th style='text-align:right;background:#264641'>Geral</th>"
         + "".join(
             f"<th style='text-align:right' title='{sigla_to_nome[sigla]}'>{sigla}</th>"
             for sigla, _ in BIG_AREAS_ORDER
@@ -2903,11 +3153,11 @@ with tab_qualidade:
             series, x="mes", y="valor", color="metrica", markers=True,
             labels={"mes": "Mês", "valor": "Média ★", "metrica": "Conteúdo"},
             color_discrete_map={
-                "Aulas": "#32578A",
-                "Comentários de questões": "#841A81",
-                "E-book": "#04A36A",
-                "Resumo": "#EAB904",
-                "Mapa mental": "#FF7F50",
+                "Aulas": "#50BCFF",
+                "Comentários de questões": "#9500DB",
+                "E-book": "#6CE190",
+                "Resumo": "#FFC805",
+                "Mapa mental": "#FF7013",
                 "Flashcards": "#6CE190",
             },
         )
@@ -2917,11 +3167,11 @@ with tab_qualidade:
                 x=row["mes"], y=row["valor"],
                 text=f"n={row['n']}",
                 showarrow=False, yshift=12,
-                font=dict(size=10, color="#71717a"),
+                font=dict(size=10, color="#93A8A2"),
             )
         fig.update_layout(
             height=420,
-            plot_bgcolor="#fff", paper_bgcolor="#fff",
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             margin=dict(l=10, r=10, t=10, b=10),
             yaxis=dict(range=[1, 5], dtick=0.5),
             xaxis=dict(tickformat="%b/%y"),
