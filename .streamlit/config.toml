@@ -1,9 +1,12 @@
+# Cores do Brandbook EMR 2026 (p.102). backgroundColor/secondaryBackgroundColor
+# são derivações escuras de Residente Green #264641 — o brandbook não define
+# tema dark de app. Mantenha em sincronia com o :root de streamlit_app_public.py.
 [theme]
-base = "light"
-primaryColor = "#0f766e"
-backgroundColor = "#f8f9fa"
-secondaryBackgroundColor = "#ffffff"
-textColor = "#18181b"
+base = "dark"
+primaryColor = "#B4F900"           # Residente Lime
+backgroundColor = "#101E1B"        # derivado de #264641
+secondaryBackgroundColor = "#1A302C"
+textColor = "#F8F8F8"              # Residente Off White
 font = "sans serif"
 
 [server]

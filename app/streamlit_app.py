@@ -1,7 +1,7 @@
 """
-Dashboard v2 — protótipo das abas "Agora" + "Evolução".
+Dashboard v2 — abas "Agora" + "Evolução".
 
-Roda em paralelo ao streamlit_app.py, usando o mesmo parquet. Sem login (acesso aberto).
+Roda em paralelo ao streamlit_app.py, usando o mesmo parquet e gate de senha.
 Foco: responder em 30s "onde a turma está hoje e pra onde está indo".
 """
 
@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import os
 import tempfile
-from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +18,39 @@ import plotly.io as pio
 from plotly.subplots import make_subplots
 import requests
 import streamlit as st
+
+try:
+    from prescription_v2 import (
+        EXCEL_VOLUME_PROFILE,
+        PRESCRIPTION_MONTHLY,
+        PRESCRIPTION_ORDER,
+        PRESCRIPTION_TARGETS,
+        PRESCRIPTION_VERSION,
+    )
+    from snapshot_utils import (
+        activity_month_labels,
+        deduplicate_accounts,
+        deduplicate_account_metrics,
+        detect_atypical_collection,
+        eligible_cohort_for_month,
+        weekly_student_ratio,
+    )
+except ModuleNotFoundError:
+    from app.prescription_v2 import (
+        EXCEL_VOLUME_PROFILE,
+        PRESCRIPTION_MONTHLY,
+        PRESCRIPTION_ORDER,
+        PRESCRIPTION_TARGETS,
+        PRESCRIPTION_VERSION,
+    )
+    from app.snapshot_utils import (
+        activity_month_labels,
+        deduplicate_accounts,
+        deduplicate_account_metrics,
+        detect_atypical_collection,
+        eligible_cohort_for_month,
+        weekly_student_ratio,
+    )
 
 # Paleta canônica — Brandbook EMR 2026, p.102. Espelha as CSS vars do bloco de
 # estilo abaixo; se mudar aqui, mude lá. Nomes são os do brandbook.
@@ -76,14 +108,19 @@ st.set_page_config(page_title="Dashboard EMR · R1 2026", layout="wide", initial
 def _require_password() -> None:
     """Gate de senha única compartilhada. A senha (hash bcrypt) vive em
     st.secrets["APP_PASSWORD_HASH"] no Streamlit Cloud — nunca no repositório.
-    Se o secret não existir (ex.: rodando local sem secrets), o app libera o
-    acesso para não bloquear o desenvolvimento."""
+    Sem o secret, falha fechado. Desenvolvimento sem senha exige a opção local
+    explícita ALLOW_INSECURE_LOCAL=true."""
     try:
         pw_hash = st.secrets.get("APP_PASSWORD_HASH")
     except Exception:
         pw_hash = None
     if not pw_hash:
-        return  # sem senha configurada → acesso liberado (dev/local)
+        allow_local = os.getenv("ALLOW_INSECURE_LOCAL", "").strip().lower()
+        if allow_local in {"1", "true", "yes"}:
+            st.warning("Modo local sem senha habilitado por ALLOW_INSECURE_LOCAL.")
+            return
+        st.error("Configuração inválida: APP_PASSWORD_HASH não foi definido.")
+        st.stop()
     if st.session_state.get("_authed"):
         return
     import bcrypt
@@ -434,52 +471,8 @@ st.markdown(
 )
 
 # ============================================================
-# CONSTANTES — canais de acerto canônico (faixas) e prescrição volumétrica
+# CONSTANTES — régua oficial v2, centralizada em prescription_v2.py
 # ============================================================
-
-# Canal de acerto canônico — v4 editorial (mesmo canal v3; v4 mantém intacto):
-# - Excelência: ramp 55→75% (±3pp), slope slow Q1 (+1pp/m) · medium Q2 (+2pp/m) · fast Q3 (+4pp/m).
-# - Proficiência: ramp 45→65% (±3pp), mesma curva deslocada -10pp. Tier não-contíguo
-#   (gap de 4pp entre prof_max e excel_min cai em Proficiência via classify()).
-# Fonte: prescricao_excelencia_v4.md + prescricao_proficiencia_v4.md (3 cenários).
-PRESCRIPTION_MONTHLY = {
-    "2026-01": {"label": "jan/26", "prof_min": 42, "prof_max": 48, "excel_min": 52, "excel_max": 58, "source": "v3_editorial"},
-    "2026-02": {"label": "fev/26", "prof_min": 43, "prof_max": 49, "excel_min": 53, "excel_max": 59, "source": "v3_editorial"},
-    "2026-03": {"label": "mar/26", "prof_min": 44, "prof_max": 50, "excel_min": 54, "excel_max": 60, "source": "v3_editorial"},
-    "2026-04": {"label": "abr/26", "prof_min": 46, "prof_max": 52, "excel_min": 56, "excel_max": 62, "source": "v3_editorial"},
-    "2026-05": {"label": "mai/26", "prof_min": 48, "prof_max": 54, "excel_min": 58, "excel_max": 64, "source": "v3_editorial"},
-    "2026-06": {"label": "jun/26", "prof_min": 50, "prof_max": 56, "excel_min": 60, "excel_max": 66, "source": "v3_editorial"},
-    "2026-07": {"label": "jul/26", "prof_min": 54, "prof_max": 60, "excel_min": 64, "excel_max": 70, "source": "v3_editorial"},
-    "2026-08": {"label": "ago/26", "prof_min": 58, "prof_max": 64, "excel_min": 68, "excel_max": 74, "source": "v3_editorial"},
-    "2026-09": {"label": "set/26", "prof_min": 62, "prof_max": 68, "excel_min": 72, "excel_max": 78, "source": "v3_editorial"},
-}
-PRESCRIPTION_ORDER = list(PRESCRIPTION_MONTHLY.keys())
-
-# Target volumétrico mensal v4 (proficiência=LEVE, excelência=PADRÃO):
-# - Excelência (PADRÃO, P70 do tier ENAMED ≥80): 7.630q/ano · 2,5h/dia.
-# - Proficiência (LEVE, sem Inteligente + lag reduzido): 5.920q/ano · 2,1h/dia.
-# Blocos: 800/ano (~100/mês; jan/set meio-mês). Flashcards: 930/ano (~120/mês).
-# short_fmt = Fixação + Revisão mensais.
-# Fonte: prescricao_excelencia_v4.md + prescricao_proficiencia_v4.md.
-PRESCRIPTION_TARGETS = {
-    "2026-01": {"questoes": (300, 300),   "flashcards": (60, 60),   "blocos": (50, 50),   "dias_ativos": (9, 9),   "short_fmt": (8, 8)},
-    "2026-02": {"questoes": (540, 640),   "flashcards": (120, 120), "blocos": (100, 100), "dias_ativos": (14, 19), "short_fmt": (16, 16)},
-    "2026-03": {"questoes": (680, 880),   "flashcards": (120, 120), "blocos": (100, 100), "dias_ativos": (15, 19), "short_fmt": (16, 16)},
-    "2026-04": {"questoes": (680, 920),   "flashcards": (120, 120), "blocos": (100, 100), "dias_ativos": (16, 20), "short_fmt": (16, 16)},
-    "2026-05": {"questoes": (780, 1060),  "flashcards": (120, 120), "blocos": (100, 100), "dias_ativos": (17, 20), "short_fmt": (16, 16)},
-    "2026-06": {"questoes": (880, 1160),  "flashcards": (120, 120), "blocos": (100, 100), "dias_ativos": (18, 21), "short_fmt": (16, 16)},
-    "2026-07": {"questoes": (920, 1200),  "flashcards": (120, 120), "blocos": (100, 100), "dias_ativos": (19, 21), "short_fmt": (16, 16)},
-    "2026-08": {"questoes": (960, 1240),  "flashcards": (120, 120), "blocos": (100, 100), "dias_ativos": (20, 22), "short_fmt": (16, 16)},
-    "2026-09": {"questoes": (180, 230),   "flashcards": (30, 30),   "blocos": (50, 50),   "dias_ativos": (12, 22), "short_fmt": (4, 4)},
-}
-
-DIMENSIONS = [
-    ("questoes",     "Questões / mês"),
-    ("flashcards",   "Flashcards / mês"),
-    ("blocos",       "Blocos de aula / mês"),
-    ("short_fmt",    "Short-fmt (FIXATION + REVISION) / mês"),
-    ("dias_ativos",  "Dias ativos / mês"),
-]
 
 MONTH_LABELS_PT = {
     1: "jan", 2: "fev", 3: "mar", 4: "abr", 5: "mai", 6: "jun",
@@ -496,6 +489,26 @@ def _format_mes(yyyymm: str) -> str:
         return f"{MONTH_LABELS_PT[int(m)]}/{y[-2:]}"
     except Exception:
         return yyyymm
+
+
+def _feedback_critical_pct(feedbacks: pd.DataFrame) -> float:
+    """Percentual crítico entre registros com nota válida."""
+    notas = pd.to_numeric(feedbacks["nota"], errors="coerce")
+    avaliados = notas.between(1, 5)
+    if not avaliados.any():
+        return 0.0
+    return float(notas.loc[avaliados].le(2).mean() * 100)
+
+
+def _feedbacks_com_nota_valida(feedbacks: pd.DataFrame) -> pd.DataFrame:
+    """Mantém somente avaliações com nota inteira de 1 a 5."""
+    if feedbacks.empty or "nota" not in feedbacks.columns:
+        return feedbacks.iloc[0:0].copy()
+    validos = feedbacks.copy()
+    validos["nota"] = pd.to_numeric(validos["nota"], errors="coerce")
+    validos = validos[validos["nota"].isin([1, 2, 3, 4, 5])].copy()
+    validos["nota"] = validos["nota"].astype(int)
+    return validos
 
 
 def assign_safra(first_start: pd.Series) -> pd.Series:
@@ -540,8 +553,8 @@ def _data_token() -> str | None:
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _release_asset_urls(token: str) -> dict[str, str]:
-    """Mapa asset_name → api_url do release privado (tag DATA_TAG)."""
+def _release_assets(token: str) -> dict[str, dict[str, str]]:
+    """Metadados dos assets do release privado, incluindo data real."""
     r = requests.get(
         f"https://api.github.com/repos/{DATA_REPO}/releases/tags/{DATA_TAG}",
         headers={"Authorization": f"token {token}",
@@ -549,7 +562,26 @@ def _release_asset_urls(token: str) -> dict[str, str]:
         timeout=30,
     )
     r.raise_for_status()
-    return {a["name"]: a["url"] for a in r.json().get("assets", [])}
+    return {
+        asset["name"]: {
+            "url": asset["url"],
+            "updated_at": asset["updated_at"],
+        }
+        for asset in r.json().get("assets", [])
+    }
+
+
+def _release_asset_urls(token: str) -> dict[str, str]:
+    """Mapa asset_name → api_url, preservado para o downloader."""
+    return {name: data["url"] for name, data in _release_assets(token).items()}
+
+
+def _release_asset_snapshot_date(token: str, asset_name: str) -> pd.Timestamp:
+    """Data do asset no release; nunca confunde hora do acesso com frescor."""
+    asset = _release_assets(token).get(asset_name)
+    if not asset or not asset.get("updated_at"):
+        raise FileNotFoundError(f"Metadado ausente para o asset {asset_name}.")
+    return pd.Timestamp(asset["updated_at"]).tz_convert("America/Sao_Paulo")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -605,6 +637,28 @@ def _normalize_canonico(d: pd.DataFrame) -> pd.DataFrame:
     return d.rename(columns=cols) if cols else d
 
 
+def _validate_snapshot_frames(
+    df: pd.DataFrame,
+    cohort: pd.DataFrame,
+    metrics: pd.DataFrame,
+    source_label: str,
+) -> None:
+    """Converte asset ausente/schema inválido em erro explícito e tratável."""
+    required = (
+        ("atividade", df, {"account_id", "semana_iso"}),
+        ("cohort", cohort, {"account_id"}),
+        ("métricas", metrics, {"account_id"}),
+    )
+    missing = [
+        name for name, frame, columns in required
+        if not columns.issubset(frame.columns)
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"Snapshot {source_label} incompleto: {', '.join(missing)}."
+        )
+
+
 def load_snapshot(snap_dir: Path = SNAPSHOTS):
     # B2C: asset do release com nome simples; B2B usa _read_b2b_parquet (prefixo b2b__).
     is_b2b = snap_dir == SNAPSHOTS_B2B_DIR
@@ -612,15 +666,27 @@ def load_snapshot(snap_dir: Path = SNAPSHOTS):
     df = _normalize_canonico(_read_parquet_source(f"{pref}latest.parquet", snap_dir / "latest.parquet"))
     cohort = _read_parquet_source(f"{pref}latest_cohort.parquet", snap_dir / "latest_cohort.parquet")
     metrics = _normalize_canonico(_read_parquet_source(f"{pref}latest_cohort_metrics.parquet", snap_dir / "latest_cohort_metrics.parquet"))
+    _validate_snapshot_frames(
+        df,
+        cohort,
+        metrics,
+        "B2B" if is_b2b else "B2C",
+    )
     df["semana_iso"] = pd.to_datetime(df["semana_iso"])
+    if "mes_ref" in df.columns:
+        df["mes_ref"] = pd.to_datetime(df["mes_ref"])
     for d in (df, cohort, metrics):
         d["account_id"] = d["account_id"].astype(int)
-    # Data do snapshot: mtime do arquivo local (dev) ou agora (release/runtime).
+    metrics = deduplicate_account_metrics(metrics)
+    # Data do snapshot: mtime local ou updated_at real do asset no release.
     local = snap_dir / "latest.parquet"
-    if not _data_token() and local.exists():
+    token = _data_token()
+    if token:
+        snap_date = _release_asset_snapshot_date(token, f"{pref}latest.parquet")
+    elif local.exists():
         snap_date = pd.Timestamp(local.resolve().stat().st_mtime, unit="s", tz="UTC").tz_convert("America/Sao_Paulo")
     else:
-        snap_date = pd.Timestamp.now(tz="America/Sao_Paulo")
+        raise FileNotFoundError(f"Snapshot local ausente: {local}.")
     return df, cohort, metrics, snap_date
 
 
@@ -634,11 +700,11 @@ TURMAS_EXCLUIDAS = {"Teste Grátis"}
 
 # Cohort B2C tem 1 linha por (account_id, turma) — alunos em 2+ turmas duplicam.
 # `cohort_turma` preserva a coluna `turma` (pra filtros). `cohort` global é
-# deduplicado por account_id (mantém a 1ª turma observada, pra compat com
+# deduplicado por account_id (mantém a matrícula mais antiga, pra compat com
 # aggregate_month e demais funções que esperam 1 linha por aluno).
 if "turma" in cohort.columns:
     cohort_turma = cohort[~cohort["turma"].isin(TURMAS_EXCLUIDAS)].copy()
-    cohort = cohort_turma.drop_duplicates("account_id", keep="first").drop(columns=["turma"])
+    cohort = deduplicate_accounts(cohort_turma).drop(columns=["turma"])
 else:
     cohort_turma = cohort.assign(turma="Geral")
 
@@ -677,7 +743,7 @@ def load_avaliacoes_aulas(account_ids: tuple[int, ...]) -> pd.DataFrame:
 
 @st.cache_data(ttl=60 * 60, show_spinner="Carregando avaliações de questões…")
 def load_avaliacoes_questoes(account_ids: tuple[int, ...]) -> pd.DataFrame:
-    """Avaliações de comentários de questões do parquet."""
+    """Avaliações de explicações de questões do parquet."""
     return _filter_by_accounts(_read_b2b_parquet("avaliacoes_questoes.parquet"), account_ids)
 
 
@@ -691,6 +757,14 @@ def load_avaliacoes_materiais(account_ids: tuple[int, ...]) -> pd.DataFrame:
 def load_avaliacoes_flashcards(account_ids: tuple[int, ...]) -> pd.DataFrame:
     """Avaliações de decks de flashcards do parquet."""
     return _filter_by_accounts(_read_b2b_parquet("avaliacoes_flashcards.parquet"), account_ids)
+
+
+@st.cache_data(ttl=60 * 60, show_spinner="Carregando feedbacks…")
+def load_feedbacks_organicos() -> pd.DataFrame:
+    """Feedbacks sanitizados, sem identificador interno da conta."""
+    return _read_b2b_parquet("feedbacks_organicos.parquet").drop(
+        columns=["account_id"], errors="ignore"
+    )
 
 
 # Simulados institucionais ENAMED 2026 (Inspirali, FMO, FACAPE, …).
@@ -763,9 +837,9 @@ CANAL_MIN_N_MOCK_TAKERS = 100
 def recompute_canais_2026(df_w: pd.DataFrame, cohort_df: pd.DataFrame) -> dict[str, dict]:
     """Anota observações empíricas (n_mock_takers, P75/P90 reais) por mês.
 
-    NÃO sobrescreve os valores editoriais v4 (excel_min/excel_max do dict).
-    O canal v4 da Excelência é decisão editorial calibrada com cohort R1 2025
-    ENAMED ≥80 (ver prescricao_excelencia_v4.md); não é o P75/P90 cru.
+    NÃO sobrescreve os canais editoriais v2. Eles vêm dos documentos reais
+    prescricao_excelencia_v2.md e prescricao_proficiencia_v2.md, não dos
+    percentis empíricos crus.
 
     Esta função preserva os percentis empíricos pra instrumentação e validação,
     mas eles não alteram a classificação.
@@ -776,8 +850,9 @@ def recompute_canais_2026(df_w: pd.DataFrame, cohort_df: pd.DataFrame) -> dict[s
     coh_ids = coh_2026["account_id"].unique()
 
     out: dict[str, dict] = {}
+    activity_month = activity_month_labels(df_w)
     for mes in PRESCRIPTION_ORDER:
-        sub = df_w[df_w["semana_iso"].dt.to_period("M").astype(str) == mes]
+        sub = df_w[activity_month == mes]
         sub = sub[sub["account_id"].isin(coh_ids)]
         agg = sub.groupby("account_id", as_index=False).agg(
             acertos=("acerto_canonico_acertos", "sum"),
@@ -804,6 +879,7 @@ for _mes, _vals in _canais_novos.items():
 def classify(acerto_canonico_pct: float, mes: str) -> str:
     if pd.isna(acerto_canonico_pct):
         return "Sem acerto canônico"
+    acerto_canonico_pct = round(float(acerto_canonico_pct), 10)
     t = PRESCRIPTION_MONTHLY[mes]
     if acerto_canonico_pct >= t["excel_min"]:
         return "Excelência"
@@ -818,7 +894,8 @@ def aggregate_month(df_weekly: pd.DataFrame, mes: str, cohort_df: pd.DataFrame |
     Se `cohort_df` for None, usa o cohort B2C global (padrão).
     """
     coh = cohort if cohort_df is None else cohort_df
-    sub = df_weekly[df_weekly["semana_iso"].dt.to_period("M").astype(str) == mes]
+    coh = eligible_cohort_for_month(coh, mes)
+    sub = df_weekly[activity_month_labels(df_weekly) == mes]
     agg = sub.groupby("account_id", as_index=False).agg(
         dias_ativos=("dias_ativos", "sum"),
         questoes=("questoes", "sum"),
@@ -851,7 +928,7 @@ def closed_months(today: pd.Timestamp, df_w: pd.DataFrame | None = None) -> list
     df_ = df if df_w is None else df_w
     cur = today.to_period("M").strftime("%Y-%m")
     return [m for m in PRESCRIPTION_ORDER if m < cur and m in set(
-        df_["semana_iso"].dt.to_period("M").astype(str).unique()
+        activity_month_labels(df_).unique()
     )]
 
 
@@ -916,8 +993,14 @@ prev_mes_label = PRESCRIPTION_MONTHLY[prev_closed]["label"] if prev_closed else 
 cur_per = aggregate_month(df, last_closed)
 
 
-tab_agora, tab_b2b, tab_evolucao, tab_qualidade = st.tabs(
-    ["Visão geral B2C", "Visão geral B2B", "Evolução B2C", "Qualidade B2C"]
+tab_agora, tab_b2b, tab_evolucao, tab_qualidade, tab_voz = st.tabs(
+    [
+        "Visão geral B2C",
+        "Visão geral B2B",
+        "Evolução B2C",
+        "Qualidade B2C",
+        "Voz do aluno",
+    ]
 )
 
 
@@ -1172,13 +1255,13 @@ def narrativa_canal_acerto(ac_df, total):
         )
     elif ultimo["mediana_turma"] >= ultimo["prof_min"]:
         posicao = (
-            f"<strong>dentro do canal Proficiência v1</strong> "
+            f"<strong>dentro do canal Proficiência v2</strong> "
             f"({ultimo['prof_min']}–{ultimo['prof_max']}%), "
             f"a {ultimo['excel_min'] - ultimo['mediana_turma']:.1f}pp de entrar no canal Excelência v2"
         )
     else:
         posicao = (
-            f"<strong>abaixo do canal Proficiência v1</strong> "
+            f"<strong>abaixo do canal Proficiência v2</strong> "
             f"(piso {ultimo['prof_min']}%), com gap de "
             f"{ultimo['prof_min'] - ultimo['mediana_turma']:.1f}pp pra entrar no canal"
         )
@@ -1452,10 +1535,15 @@ def narrativa_leadlag(ll_n, ll_pct, ll_total, ll_pairs, cm_pct):
 # `prev_closed` no momento da chamada. Para renderizar B2B, basta sobrescrever
 # essas globais antes de chamar (ver `with tab_b2b:` abaixo).
 
-def _compute_status_geral(df_: pd.DataFrame, cohort_: pd.DataFrame, last_closed_: str) -> dict:
+def _compute_status_geral(
+    df_: pd.DataFrame,
+    cohort_: pd.DataFrame,
+    last_closed_: str,
+    reference_date: pd.Timestamp,
+) -> dict:
     """Calcula 4 indicadores de status do cohort em 2026:
 
-    - **Pagantes**: tamanho do cohort (inscrição válida — já filtrado upstream).
+    - **Matrículas ativas**: tamanho do cohort (inscrição válida — filtrado upstream).
     - **Ativos**: alunos com `dias_ativos > 0` na última semana ISO fechada.
       `dias_ativos` = qualquer atividade (questão, aula/bloco ≥50%, flashcard).
     - **Engajados**: média semanal ≥25 questões E ≥8 blocos desde a primeira
@@ -1466,8 +1554,10 @@ def _compute_status_geral(df_: pd.DataFrame, cohort_: pd.DataFrame, last_closed_
     n_pagantes = len(cohort_)
 
     # --- Ativos na última semana ISO fechada ---
-    _hoje = pd.Timestamp(date.today())
-    _full_monday = _hoje - pd.Timedelta(days=int(_hoje.weekday()) + 7)
+    reference_date = pd.Timestamp(reference_date).normalize()
+    _full_monday = reference_date - pd.Timedelta(
+        days=int(reference_date.weekday()) + 7
+    )
     recent = df_[(df_["semana_iso"] == _full_monday) & (df_["dias_ativos"] > 0)]
     recent = recent[recent["account_id"].isin(cohort_ids)]
     n_ativos_semana = int(recent["account_id"].nunique())
@@ -1512,9 +1602,14 @@ def _compute_status_geral(df_: pd.DataFrame, cohort_: pd.DataFrame, last_closed_
             "n_engajados": n_engajados, "n_meta_min": n_meta_min}
 
 
-def _render_agora_now(key_prefix: str = "agora"):
+def _render_agora_now(
+    metrics_df: pd.DataFrame,
+    reference_date: pd.Timestamp,
+    key_prefix: str = "agora",
+):
     # --- Status geral: pagantes, ativos (última semana fechada), engajados, meta mínima ---
-    _status = _compute_status_geral(df, cohort, last_closed)
+    reference_date = pd.Timestamp(reference_date).normalize()
+    _status = _compute_status_geral(df, cohort, last_closed, reference_date)
     _stat_pagantes = _status["n_pagantes"]
     _stat_ativos = _status["n_ativos_semana"]
     _stat_engaj = _status["n_engajados"]
@@ -1529,7 +1624,7 @@ def _render_agora_now(key_prefix: str = "agora"):
     sg1.markdown(
         f"""<div class="kpi">
           <div class="kpi-main">
-            <div class="kpi-eyebrow"><span class="dot" style="background:var(--emr-green-deep)"></span>Pagantes</div>
+            <div class="kpi-eyebrow"><span class="dot" style="background:var(--emr-green-deep)"></span>Matrículas ativas</div>
             <div class="kpi-val">{_stat_pagantes:,}</div>
             <div class="kpi-sub">inscrição ativa</div>
           </div>
@@ -1563,23 +1658,27 @@ def _render_agora_now(key_prefix: str = "agora"):
     # (Janela fixa: último mês fechado, com Δ vs mês anterior.)
     cur_per = aggregate_month(df, last_closed)
     prev_per = aggregate_month(df, prev_closed) if prev_closed else None
-    cur_targets = PRESCRIPTION_TARGETS[last_closed]
     cur_mes = last_closed
     cur_mes_label = PRESCRIPTION_MONTHLY[last_closed]["label"]
     prev_mes_label = PRESCRIPTION_MONTHLY[prev_closed]["label"] if prev_closed else None
 
     cur_counts = faixa_counts(cur_per)
     prev_counts = faixa_counts(prev_per) if prev_per is not None else None
+    cur_total = len(cur_per)
+    prev_total = len(prev_per) if prev_per is not None else 0
 
     st.markdown("&nbsp;")
     _ch = PRESCRIPTION_MONTHLY[cur_mes]
     _meaning_dyn = {
         "Excelência":          f"acertou ≥{_ch['excel_min']}% no mock de {cur_mes_label}",
-        "Proficiência":        f"acertou {_ch['prof_min']}–{_ch['excel_min']-1}% no mock de {cur_mes_label}",
+        "Proficiência":        f"acertou ≥{_ch['prof_min']}% e <{_ch['excel_min']}% no mock de {cur_mes_label}",
         "Abaixo do canal":     f"acertou <{_ch['prof_min']}% no mock de {cur_mes_label}",
         "Sem acerto canônico": f"não fez mock canônico em {cur_mes_label}",
     }
-    _pcts = {f: cur_counts[f] / total * 100 for f in PRESCRIPTION_CLASSES}
+    _pcts = {
+        f: cur_counts[f] / cur_total * 100 if cur_total else 0.0
+        for f in PRESCRIPTION_CLASSES
+    }
     _c1 = _pcts["Excelência"]
     _c2 = _c1 + _pcts["Proficiência"]
     _c3 = _c2 + _pcts["Abaixo do canal"]
@@ -1616,7 +1715,7 @@ def _render_agora_now(key_prefix: str = "agora"):
 
         if prev_counts is not None:
             n_prev = prev_counts[faixa]
-            pct_prev = n_prev / total * 100
+            pct_prev = n_prev / prev_total * 100 if prev_total else 0.0
             delta_pp = pct_cur - pct_prev
             if abs(delta_pp) < 0.5:
                 delta_html = f'<span class="chip-delta flat">≈ vs {prev_mes_label}</span>'
@@ -1634,7 +1733,7 @@ def _render_agora_now(key_prefix: str = "agora"):
               <div class="kpi-eyebrow"><span class="dot" style="background:{color}"></span>{faixa}</div>
               <div class="kpi-val">{pct_cur:.0f}<span>%</span></div>
               <div class="pbar" style="--p:{pct_cur:.1f}; --fill:{color}"><i></i></div>
-              <div class="kpi-sub">{n_cur:,} de {total:,} · {meaning}</div>
+              <div class="kpi-sub">{n_cur:,} de {cur_total:,} · {meaning}</div>
               <div>{delta_html}</div>
             </div>""",
             unsafe_allow_html=True,
@@ -1649,7 +1748,7 @@ def _render_agora_now(key_prefix: str = "agora"):
     # Denominador = cohort inteiro (zeros incluídos — aluno sem atividade conta 0).
     # Última semana ISO completa = semana anterior à corrente; corrente = parcial.
     _cohort_ids_q = cohort["account_id"].astype(int).tolist()
-    _cur_monday = today - pd.Timedelta(days=int(today.weekday()))
+    _cur_monday = reference_date - pd.Timedelta(days=int(reference_date.weekday()))
     _full_monday = _cur_monday - pd.Timedelta(days=7)
 
     def _q_semana(monday: pd.Timestamp) -> tuple[float, float] | None:
@@ -1726,7 +1825,7 @@ def _render_agora_now(key_prefix: str = "agora"):
         )
         header_cells += (
             f"<th style='text-align:right'>Turma toda"
-            f"<br><span style='font-size:11px;color:#93A8A2;font-weight:400'>n={total:,}</span></th>"
+            f"<br><span style='font-size:11px;color:#93A8A2;font-weight:400'>n={cur_total:,}</span></th>"
         )
         return (
             f"<table class='gap-table'>"
@@ -1749,15 +1848,18 @@ def _render_agora_now(key_prefix: str = "agora"):
     # Mostra o volume total que cada aluno construiu desde o início do extensivo.
     # Faixa usada é a do mês de referência (cur_mes) — mostra "quanto de esforço
     # acumulado cada faixa atual já fez". Comparável com o joelho dose-response.
-    _df_acum = df[df["semana_iso"].dt.to_period("M").astype(str) <= cur_mes]
+    _df_acum = df[activity_month_labels(df) <= cur_mes]
     _acum_aluno = _df_acum.groupby("account_id", as_index=False).agg(
         questoes=("questoes", "sum"),
         flashcards=("flashcards", "sum"),
         blocos=("blocos", "sum"),
         dias_ativos=("dias_ativos", "sum"),
     )
-    # Cohort completo com 0 pra quem nunca fez nada
-    _acum_per = cohort[["account_id"]].merge(_acum_aluno, on="account_id", how="left").fillna(0)
+    # Cohort elegível no mês com 0 pra quem ainda não fez nada
+    _cohort_cur = cohort[cohort["account_id"].isin(cur_per["account_id"])]
+    _acum_per = _cohort_cur[["account_id"]].merge(
+        _acum_aluno, on="account_id", how="left"
+    ).fillna(0)
     _acum_per = _acum_per.merge(cur_per[["account_id", "faixa"]], on="account_id", how="left")
     _acum_stats_faixas = {
         f: _acum_per[_acum_per["faixa"] == f][[c for c, _ in _vol_cols]]
@@ -1790,7 +1892,7 @@ def _render_agora_now(key_prefix: str = "agora"):
         )
         header_cells += (
             f"<th style='text-align:right'>Turma toda"
-            f"<br><span style='font-size:11px;color:#93A8A2;font-weight:400'>n={total:,}</span></th>"
+            f"<br><span style='font-size:11px;color:#93A8A2;font-weight:400'>n={cur_total:,}</span></th>"
         )
         return (
             f"<table class='gap-table'>"
@@ -1813,9 +1915,11 @@ def _render_agora_now(key_prefix: str = "agora"):
     # --- Bloco 3: scatter acionável ---
     st.markdown("&nbsp;")
     st.markdown("##### Mapa da turma — Questões × Acerto")
-    st.caption("Cada ponto é 1 aluno (acumulado).")
+    st.caption(
+        "Cada ponto é 1 aluno. Posição = acumulado; cor e pisos = faixa do último mês fechado."
+    )
 
-    scatter_df = metrics_acum.merge(
+    scatter_df = metrics_df.merge(
         cur_per[["account_id", "faixa"]], on="account_id", how="left"
     ).dropna(subset=["acerto_canonico_pct"])
     scatter_df["faixa"] = scatter_df["faixa"].astype(
@@ -1841,10 +1945,10 @@ def _render_agora_now(key_prefix: str = "agora"):
     )
     ref = PRESCRIPTION_MONTHLY[cur_mes]
     fig.add_hline(y=ref["prof_min"], line_dash="dot", line_color="#50BCFF",
-                  annotation_text=f"P25 Proficiência {ref['label']} ({ref['prof_min']}%)",
+                  annotation_text=f"Piso Proficiência {PRESCRIPTION_VERSION} {ref['label']} ({ref['prof_min']:g}%)",
                   annotation_position="bottom right")
     fig.add_hline(y=ref["excel_min"], line_dash="dot", line_color="#6CE190",
-                  annotation_text=f"P25 Excelência {ref['label']} ({ref['excel_min']}%)",
+                  annotation_text=f"Piso Excelência {PRESCRIPTION_VERSION} {ref['label']} ({ref['excel_min']:g}%)",
                   annotation_position="top right")
     fig.update_layout(
         height=360,
@@ -1852,7 +1956,7 @@ def _render_agora_now(key_prefix: str = "agora"):
         margin=dict(l=10, r=10, t=10, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=-0.22),
     )
-    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_scatter_map")
+    st.plotly_chart(fig, width="stretch", key=f"{key_prefix}_scatter_map")
 
 
 # Aba Agora — 9 sub-abas (Geral + 8 turmas). Reusa _render_agora_now via swap
@@ -1862,7 +1966,7 @@ def _render_agora_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pr
     if cohort_filtrado.empty:
         st.warning(f"Sem alunos em {label_grupo}.")
         return
-    cohort_uniq = cohort_filtrado.drop_duplicates("account_id", keep="first")
+    cohort_uniq = deduplicate_accounts(cohort_filtrado)
     if "turma" in cohort_uniq.columns:
         cohort_uniq = cohort_uniq.drop(columns=["turma"])
     ids = set(cohort_uniq["account_id"].astype(int).tolist())
@@ -1889,7 +1993,12 @@ def _render_agora_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pr
             ].nunique())
             _rev_txt = f" · {_n_rev:,} com Revisão ({_n_rev / total * 100:.0f}%)" if total else ""
         st.caption(f"**{label_grupo}** — {total:,} alunos{_rev_txt}. Snapshot {snapshot_date:%d/%m %H:%M}.")
-        _render_agora_now(key_prefix=key_prefix)
+        metrics_filtrado = metrics_acum[metrics_acum["account_id"].isin(ids)]
+        _render_agora_now(
+            metrics_filtrado,
+            reference_date=today,
+            key_prefix=key_prefix,
+        )
     finally:
         df, cohort, total, months_closed, last_closed, prev_closed, cur_per = _saves
 
@@ -1928,9 +2037,9 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
                        ies_filtro: str | None = None):
     """Renderiza os blocos da aba Agora para um subset filtrado do cohort B2B.
 
-    Faz swap das globais (df, cohort, total, last_closed, etc.) pra que
-    `_render_agora_now()` use o subset filtrado. `ies_filtro` restringe a tabela
-    de simulados institucionais às edições da IES do grupo (None = todas).
+    Faz swap das globais (df, cohort, total, last_closed, etc.) e passa as
+    métricas B2B explicitamente. `ies_filtro` restringe a tabela de simulados
+    institucionais às edições da IES do grupo (None = todas).
     """
     if cohort_filtrado.empty:
         st.warning(f"Nenhum aluno em `{label_grupo}` no cohort B2B.")
@@ -1944,9 +2053,10 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
     _mc_save, _last_save, _prev_save, _cur_per_save = months_closed, last_closed, prev_closed, cur_per
     try:
         df = df_filtrado
-        cohort = cohort_filtrado.drop_duplicates("account_id")
+        cohort = deduplicate_accounts(cohort_filtrado)
         total = len(cohort)
-        months_closed = closed_months(today, df_filtrado)
+        b2b_today = pd.Timestamp(snapshot_date_b2b.date())
+        months_closed = closed_months(b2b_today, df_filtrado)
         if not months_closed:
             st.info(f"Sem mês fechado com atividade em `{label_grupo}`.")
             return
@@ -1954,10 +2064,17 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
         prev_closed = months_closed[-2] if len(months_closed) >= 2 else None
         cur_per = aggregate_month(df, last_closed, cohort_df=cohort)
         st.info(
-            f"📊 **{label_grupo}** — {total:,} alunos. Mesma régua v4 aplicada. "
+            f"📊 **{label_grupo}** — {total:,} alunos. Mesma régua {PRESCRIPTION_VERSION} aplicada. "
             f"Snapshot {snapshot_date_b2b:%d/%m %H:%M}."
         )
-        _render_agora_now(key_prefix=key_prefix)
+        metrics_filtrado = metrics_acum_b2b[
+            metrics_acum_b2b["account_id"].isin(ids_filtrados)
+        ]
+        _render_agora_now(
+            metrics_filtrado,
+            reference_date=b2b_today,
+            key_prefix=key_prefix,
+        )
 
         # --- Bloco simulados institucionais ENAMED 2026: desempenho do grupo ---
         st.markdown("&nbsp;")
@@ -2048,7 +2165,7 @@ with tab_b2b:
             "Snapshot B2B não encontrado em `snapshots/b2b/latest*.parquet`. "
             "Rode `etl/extract_b2b.py` para gerar."
         )
-    elif "ies_name" not in cohort_b2b.columns:
+    elif not {"company_name", "ies_name"}.issubset(cohort_b2b.columns):
         st.warning(
             "Snapshot B2B desatualizado (sem colunas `company_name` e `ies_name`). "
             "Rode `etl/extract_b2b.py` novamente para regenerar."
@@ -2064,11 +2181,11 @@ with tab_b2b:
             "UNISUL PB", "UNISUL TUB",
             "UNP", "USJT",
         }
-        sub_inspirali, sub_geral = st.tabs(["Inspirali", "Geral"])
+        sub_inspirali, sub_geral = st.tabs(["Inspirali", "Todos os grupos"])
 
         with sub_inspirali:
             insp_cohort_all = cohort_b2b[
-                (cohort_b2b["company_id"] == 7)
+                (cohort_b2b["company_name"] == "Inspirali")
                 & (cohort_b2b["ies_name"].isin(INSPIRALI_IES_NAMES))
             ]
             ies_list = sorted(insp_cohort_all["ies_name"].dropna().unique().tolist())
@@ -2174,10 +2291,11 @@ def _filter_by_ids(cohort_ids: tuple[int, ...] | None):
 @st.cache_data(ttl=60 * 60)
 def faixa_por_mes(months: tuple[str, ...], cohort_ids: tuple[int, ...] | None = None) -> pd.DataFrame:
     """% da turma em cada faixa, mês a mês (linhas: mes; colunas: faixas)."""
-    coh, df_local, total_local = _filter_by_ids(cohort_ids)
+    coh, df_local, _ = _filter_by_ids(cohort_ids)
     rows = []
     for mes in months:
         per = aggregate_month(df_local, mes, cohort_df=coh)
+        total_local = len(per)
         counts = faixa_counts(per)
         for f, n in counts.items():
             rows.append({
@@ -2203,6 +2321,7 @@ def acerto_canonico_mensal(months: tuple[str, ...], cohort_ids: tuple[int, ...] 
             "mes_label": PRESCRIPTION_MONTHLY[mes]["label"],
             "mediana_turma": float(com_mock["acerto_canonico_pct"].median()) if len(com_mock) else None,
             "n_com_mock": len(com_mock),
+            "n_elegiveis": len(per),
             "prof_min": PRESCRIPTION_MONTHLY[mes]["prof_min"],
             "prof_max": PRESCRIPTION_MONTHLY[mes]["prof_max"],
             "excel_min": PRESCRIPTION_MONTHLY[mes]["excel_min"],
@@ -2213,10 +2332,12 @@ def acerto_canonico_mensal(months: tuple[str, ...], cohort_ids: tuple[int, ...] 
 
 @st.cache_data(ttl=60 * 60)
 def safra_excelencia(ref_mes: str, cohort_ids: tuple[int, ...] | None = None) -> pd.DataFrame:
-    """% em Excelência por safra de entrada (mês de first_start_date)."""
+    """% em Excelência por mês de entrada (first_start_date)."""
     coh_base, df_local, _ = _filter_by_ids(cohort_ids)
     per = aggregate_month(df_local, ref_mes, cohort_df=coh_base)
-    coh = coh_base[["account_id", "first_start_date"]].copy()
+    coh = coh_base[coh_base["account_id"].isin(per["account_id"])][
+        ["account_id", "first_start_date"]
+    ].copy()
     coh["first_start_date"] = pd.to_datetime(coh["first_start_date"])
     coh = coh.dropna(subset=["first_start_date"])
     coh["safra"] = assign_safra(coh["first_start_date"])
@@ -2257,8 +2378,11 @@ def prescricao_vs_resultado_q1(ref_mes: str) -> tuple[pd.DataFrame, pd.DataFrame
     if coh.empty:
         return pd.DataFrame(), pd.DataFrame(), 0
 
-    weeks = df[["account_id", "semana_iso", "blocos", "questoes", "flashcards"]].copy()
-    weeks["mes"] = weeks["semana_iso"].dt.to_period("M").astype(str)
+    month_columns = ["account_id", "semana_iso", "blocos", "questoes", "flashcards"]
+    if "mes_ref" in df.columns:
+        month_columns.append("mes_ref")
+    weeks = df[month_columns].copy()
+    weeks["mes"] = activity_month_labels(weeks)
     weeks = weeks[weeks["mes"] <= ref_mes]
     weeks["bqf"] = weeks["blocos"] + weeks["questoes"] + weeks["flashcards"]
     joined = weeks.merge(coh[["account_id", "safra"]], on="account_id", how="inner")
@@ -2511,8 +2635,11 @@ def safra_volume(ref_mes: str, cohort_ids: tuple[int, ...] | None = None) -> pd.
     coh["safra"] = assign_safra(coh["first_start_date"])
     coh = coh[coh["safra"] <= ref_mes]
 
-    weeks = df_local[["account_id", "semana_iso", "blocos", "questoes", "flashcards"]].copy()
-    weeks["mes"] = weeks["semana_iso"].dt.to_period("M").astype(str)
+    month_columns = ["account_id", "semana_iso", "blocos", "questoes", "flashcards"]
+    if "mes_ref" in df_local.columns:
+        month_columns.append("mes_ref")
+    weeks = df_local[month_columns].copy()
+    weeks["mes"] = activity_month_labels(weeks)
     weeks = weeks[weeks["mes"] <= ref_mes]
     weeks["bqf"] = weeks["blocos"] + weeks["questoes"] + weeks["flashcards"]
 
@@ -2578,7 +2705,7 @@ with tab_evolucao:
         st.stop()
 
     _evo_cohort_sel = cohort_turma[cohort_turma["turma"].isin(_evo_turmas)]
-    _evo_cohort = _evo_cohort_sel.drop_duplicates("account_id", keep="first")
+    _evo_cohort = deduplicate_accounts(_evo_cohort_sel)
     _evo_ids_tuple = tuple(sorted(int(a) for a in _evo_cohort["account_id"].unique()))
     _evo_total = len(_evo_ids_tuple)
     if _evo_total == 0:
@@ -2600,8 +2727,11 @@ with tab_evolucao:
         unsafe_allow_html=True,
     )
 
-    st.markdown("##### Trajetória das faixas — % da turma em cada faixa")
-    st.caption("Mais verde = mais Excelência. Mais cinza = menos engajamento no mock.")
+    st.markdown("##### Distribuição da turma por faixa de desempenho, mês a mês")
+    st.caption(
+        'Faixas pela régua v2. Verde = Excelência; azul = Proficiência; '
+        '"Sem acerto canônico" = não fez simulado válido no mês. Mais verde = turma melhor.'
+    )
 
     meses_tuple = tuple(months_closed)
     faixa_df = faixa_por_mes(meses_tuple, _evo_filter)
@@ -2630,12 +2760,16 @@ with tab_evolucao:
         legend=dict(orientation="h", yanchor="bottom", y=-0.25),
         hovermode="x unified",
     )
-    st.plotly_chart(fig_area, use_container_width=True)
+    st.plotly_chart(fig_area, width="stretch")
 
-    # --- Bloco 2: linha de acerto canônico mediano vs canais 2026 recalibrados ---
+    # --- Bloco 2: acerto canônico mediano vs meta mensal v2 ---
     st.markdown("&nbsp;")
-    st.markdown("##### Mediana de acerto da turma vs alvos v3")
-    st.caption("Linha = mediana de quem fez mock. Bandas = alvos v4 (Excel/Profic).")
+    st.markdown(f"##### % de acerto da turma vs. meta mensal da régua {PRESCRIPTION_VERSION}")
+    st.caption(
+        "Linha branca = mediana de acerto em simulados de quem fez simulado no mês "
+        "(n no rótulo). Faixas = intervalo-meta mensal: verde = Excelência, "
+        "azul = Proficiência."
+    )
 
     ac_df = acerto_canonico_mensal(meses_tuple, _evo_filter)
     fig_line = go.Figure()
@@ -2648,7 +2782,9 @@ with tab_evolucao:
         x=ac_df["mes_label"], y=ac_df["excel_min"], mode="lines",
         line=dict(width=0, color="#6CE190"),
         fill="tonexty", fillcolor="rgba(5,252,137,.55)",
-        name="Canal Excelência v2 (editorial)", hovertemplate="Excel %{y:.0f}%–<extra></extra>",
+        name=f"Canal Excelência {PRESCRIPTION_VERSION}",
+        customdata=ac_df["excel_max"],
+        hovertemplate=f"Excelência {PRESCRIPTION_VERSION}: %{{y:.1f}}%–%{{customdata:.1f}}%<extra></extra>",
     ))
     fig_line.add_trace(go.Scatter(
         x=ac_df["mes_label"], y=ac_df["prof_max"], mode="lines",
@@ -2658,7 +2794,9 @@ with tab_evolucao:
         x=ac_df["mes_label"], y=ac_df["prof_min"], mode="lines",
         line=dict(width=0, color="#50BCFF"),
         fill="tonexty", fillcolor="rgba(50,87,138,.50)",
-        name="Canal Proficiência v1 (2025; v2-Profic pendente)",
+        name=f"Canal Proficiência {PRESCRIPTION_VERSION}",
+        customdata=ac_df["prof_max"],
+        hovertemplate=f"Proficiência {PRESCRIPTION_VERSION}: %{{y:.1f}}%–%{{customdata:.1f}}%<extra></extra>",
     ))
     fig_line.add_trace(go.Scatter(
         x=ac_df["mes_label"], y=ac_df["mediana_turma"],
@@ -2667,8 +2805,9 @@ with tab_evolucao:
         marker=dict(size=9, color="#F8F8F8"),
         name="Mediana turma R1 2026",
         text=[
-            f"n={n}/{_evo_total}<br>({n/_evo_total*100:.0f}%)"
-            for n in ac_df["n_com_mock"]
+            f"n={n}/{elegiveis}<br>({n/elegiveis*100:.0f}%)"
+            if elegiveis else "n=0/0"
+            for n, elegiveis in zip(ac_df["n_com_mock"], ac_df["n_elegiveis"])
         ],
         textposition="top center",
         textfont=dict(size=10, color="#F8F8F8"),
@@ -2685,19 +2824,23 @@ with tab_evolucao:
         legend=dict(orientation="h", yanchor="bottom", y=-0.25),
         hovermode="x unified",
     )
-    st.plotly_chart(fig_line, use_container_width=True)
+    st.plotly_chart(fig_line, width="stretch")
 
-    # --- Bloco 3: % em Excelência por safra de entrada ---
+    # --- Bloco 3: % em Excelência por mês de entrada ---
     st.markdown("&nbsp;")
-    st.markdown(f"##### % em Excelência por safra de entrada — referência {PRESCRIPTION_MONTHLY[last_closed]['label']}")
+    st.markdown(
+        f"##### % de alunos em Excelência por mês de entrada na turma — referência "
+        f"{PRESCRIPTION_MONTHLY[last_closed]['label']}"
+    )
     st.caption(
-        "Cada barra = mês de matrícula. **jan/26** inclui veteranos pré-2026. "
-        "Safras antigas tendem a ter mais Excelência."
+        "Cada barra agrupa alunos pelo mês de matrícula. jan/26 inclui também "
+        "veteranos de antes de 2026. "
+        "Quem entrou antes teve mais tempo de curso — compare com cautela."
     )
 
     safra_df = safra_excelencia(last_closed, _evo_filter)
     if safra_df.empty:
-        st.info("Sem dados de safra disponíveis.")
+        st.info("Sem dados para as turmas e meses selecionados.")
     else:
         fig_safra = go.Figure()
         fig_safra.add_trace(go.Bar(
@@ -2722,31 +2865,37 @@ with tab_evolucao:
             xaxis=dict(title="Mês de entrada"),
             legend=dict(orientation="h", yanchor="bottom", y=-0.25),
         )
-        st.plotly_chart(fig_safra, use_container_width=True)
+        st.plotly_chart(fig_safra, width="stretch")
 
-    # --- Bloco 3b: % atingindo target de volume B+Q+F acumulado por safra ---
+    # --- Bloco 3b: % atingindo meta de volume por mês de entrada ---
     st.markdown("&nbsp;")
     st.markdown(
-        f"##### % atingindo target de volume B+Q+F acumulado por safra — referência {PRESCRIPTION_MONTHLY[last_closed]['label']}"
+        f"##### % que atingiu a meta de volume de estudo acumulado, por mês de entrada "
+        f"— referência {PRESCRIPTION_MONTHLY[last_closed]['label']}"
     )
-    st.caption("Volume = blocos+questões+flashcards acumulados. Verde = ≥alvo Excel · Azul = ≥alvo Profic.")
+    st.caption(
+        "Volume = aulas assistidas + questões respondidas + flashcards revisados, "
+        "somados desde a entrada. Unidades diferentes — leia como aproximação; "
+        "não substitui a meta por atividade. Verde = atingiu a meta Excelência "
+        f"({EXCEL_VOLUME_PROFILE}); azul = entre as metas Proficiência e Excelência."
+    )
 
     vol_df = safra_volume(last_closed, _evo_filter)
     if vol_df.empty:
-        st.info("Sem dados de safra disponíveis.")
+        st.info("Sem dados para as turmas e meses selecionados.")
     else:
         fig_vol = go.Figure()
         fig_vol.add_trace(go.Bar(
             x=vol_df["safra_label"], y=vol_df["pct_excel"],
             marker_color=PRESCRIPTION_COLORS["Excelência"],
-            name="% atingindo Excel",
+            name=f"% ≥ Excelência ({EXCEL_VOLUME_PROFILE})",
             text=[f"{p:.0f}%<br>n={t}" for p, t in zip(vol_df["pct_excel"], vol_df["total"])],
             textposition="outside",
             customdata=list(zip(vol_df["total"], vol_df["target_excel"], vol_df["mediana_bqf"])),
             hovertemplate=(
                 "Safra %{x}<br>"
-                "%{y:.1f}% ≥ target Excel<br>"
-                "Target Excel acum: %{customdata[1]:,.0f}<br>"
+                f"%{{y:.1f}}% ≥ target Excelência ({EXCEL_VOLUME_PROFILE})<br>"
+                "Target Excelência acum: %{customdata[1]:,.0f}<br>"
                 "Mediana B+Q+F acum: %{customdata[2]:,.0f}<br>"
                 "n=%{customdata[0]}<extra></extra>"
             ),
@@ -2754,12 +2903,12 @@ with tab_evolucao:
         fig_vol.add_trace(go.Bar(
             x=vol_df["safra_label"], y=vol_df["pct_prof"],
             marker_color=PRESCRIPTION_COLORS["Proficiência"],
-            name="% entre Profic e Excel",
+            name="% entre Proficiência e Excelência",
             customdata=list(zip(vol_df["total"], vol_df["target_prof"], vol_df["mediana_bqf"])),
             hovertemplate=(
                 "Safra %{x}<br>"
-                "%{y:.1f}% entre Profic e Excel<br>"
-                "Target Profic acum: %{customdata[1]:,.0f}<br>"
+                "%{y:.1f}% entre Proficiência e Excelência<br>"
+                "Target Proficiência acum: %{customdata[1]:,.0f}<br>"
                 "Mediana B+Q+F acum: %{customdata[2]:,.0f}<br>"
                 "n=%{customdata[0]}<extra></extra>"
             ),
@@ -2772,16 +2921,16 @@ with tab_evolucao:
             xaxis=dict(title="Mês de entrada"),
             legend=dict(orientation="h", yanchor="bottom", y=-0.25),
         )
-        st.plotly_chart(fig_vol, use_container_width=True)
+        st.plotly_chart(fig_vol, width="stretch")
 
     # --- Bloco 5: métricas avançadas (collapsible) ---
     st.markdown("&nbsp;")
     st.markdown("##### Métricas semanais avançadas")
     st.caption(
-        f"Excel = alunos em Excelência em {cur_mes_label}. Geral = turma toda. "
-        "Volumes: denominador = todos os pagantes do grupo, zeros incluídos "
-        "(regra 2026-07-19 — nunca comparar só com ativos). "
-        "% de acerto: só quem respondeu na semana."
+        f"Excelência = alunos na faixa Excelência em {cur_mes_label}. Turma toda = "
+        "todas as matrículas ativas. Volumes contam os zeros de quem não estudou "
+        "(denominador = todos os pagantes, regra 2026-07-19). % de acerto: só quem "
+        "respondeu na semana."
     )
 
     # Métricas: nome → (coluna no df, tipo de cálculo)
@@ -2863,8 +3012,7 @@ with tab_evolucao:
                     num, den = "acerto_canonico_acertos", "acerto_canonico_questao_count"
                 else:
                     num, den = "acertos_simples", "respostas_simples"
-                com_resposta = df_closed[df_closed[den] > 0].copy()
-                com_resposta["pct"] = com_resposta[num] / com_resposta[den] * 100
+                com_resposta = weekly_student_ratio(df_closed, num, den)
                 serie = com_resposta.groupby("semana_iso")["pct"].agg(agg_fn).reset_index()
                 serie.columns = ["semana_iso", "valor"]
             serie["metrica"] = label
@@ -2880,10 +3028,10 @@ with tab_evolucao:
             margin=dict(l=10, r=10, t=10, b=10),
             legend=dict(orientation="h", yanchor="bottom", y=-0.25),
         )
-        st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_chart")
+        st.plotly_chart(fig, width="stretch", key=f"{key_prefix}_chart")
         st.caption(f"{label_grupo}: {n_alunos:,} alunos.")
 
-    sub_excel, sub_geral = st.tabs(["Excel", "Geral"])
+    sub_excel, sub_geral = st.tabs(["Excelência", "Turma toda"])
     with sub_excel:
         _render_avancado(
             excel_ids if excel_ids else None,
@@ -2917,6 +3065,7 @@ with tab_qualidade:
     ebook = materiais[materiais["tipo_material"] == "EBOOK"].drop(columns=["tipo_material"])
     resumo = materiais[materiais["tipo_material"] == "SUMMARY"].drop(columns=["tipo_material"])
     mapa = materiais[materiais["tipo_material"] == "MIND_MAP"].drop(columns=["tipo_material"])
+    apoio = materiais[materiais["tipo_material"] == "SUPPORTING_MATERIAL"].drop(columns=["tipo_material"])
 
     def _agg_area(d: pd.DataFrame) -> dict[int, dict]:
         """Por big_area_id retorna {avg, n, n_alunos}."""
@@ -2929,33 +3078,18 @@ with tab_qualidade:
             }
         return out
 
-    def _coleta_atipica(d: pd.DataFrame, ref: pd.Timestamp) -> tuple[bool, int, float] | None:
-        """Compara n(ref) com a mediana de n dos 3 meses anteriores no MESMO df
-        (fonte já filtrada pro conteúdo). Atípico = n < 40% dessa mediana e
-        histórico com pelo menos 2 dos 3 meses anteriores presentes.
-        Retorna (atipico, n_ref, mediana_anterior) ou None se não dá pra avaliar.
-        """
-        if d.empty:
-            return None
-        meses = pd.to_datetime(d["mes"])
-        contagens = meses.dt.to_period("M").value_counts()
-        ref_p = ref.to_period("M")
-        n_ref = int(contagens.get(ref_p, 0))
-        anteriores = [contagens.get(ref_p - i, 0) for i in (1, 2, 3)]
-        anteriores_presentes = [n for n in anteriores if n > 0]
-        if n_ref == 0 or len(anteriores_presentes) < 2:
-            return None
-        mediana_ant = float(pd.Series(anteriores_presentes).median())
-        if mediana_ant <= 0:
-            return None
-        return (n_ref < mediana_ant * 0.4, n_ref, mediana_ant)
-
     def _render_qualidade_table(d: pd.DataFrame, label: str, alunos_area: bool = False,
                                 fonte_completa: pd.DataFrame | None = None,
                                 ref: pd.Timestamp | None = None) -> str:
         if d.empty:
+            _atip = (
+                detect_atypical_collection(fonte_completa, ref)
+                if fonte_completa is not None and ref is not None
+                else None
+            )
+            _alerta = " ⚠️" if _atip is not None and _atip[0] else ""
             return (
-                f"<tr><td class='dim'>{label}</td>"
+                f"<tr><td class='dim'>{label}{_alerta}</td>"
                 f"<td class='val' style='color:#93A8A2' colspan='6'>sem avaliações no mês</td></tr>"
             )
         # Geral primeiro
@@ -2967,7 +3101,11 @@ with tab_qualidade:
         # Flag de coleta atípica: volume do mês muito abaixo do histórico recente
         # (regra 2026-07-19/20 — não silenciar mês censurado como se fosse normal;
         # detecção estrutural, não conserto pontual de um mês só).
-        _atip = _coleta_atipica(fonte_completa, ref) if fonte_completa is not None and ref is not None else None
+        _atip = (
+            detect_atypical_collection(fonte_completa, ref)
+            if fonte_completa is not None and ref is not None
+            else None
+        )
         _label_html = label
         if _atip is not None and _atip[0]:
             _label_html = (
@@ -2979,7 +3117,7 @@ with tab_qualidade:
         # Geral
         cells.append(
             f"<td class='val' style='font-weight:600;background:#264641'>"
-            f"<span style='font-size:18px;color:#264641'>★ {geral_avg:.2f}</span>"
+            f"<span style='font-size:18px;color:#F8F8F8'>★ {geral_avg:.2f}</span>"
             f"<br><span style='font-size:11px;color:#93A8A2'>n={geral_n:,} · {geral_alunos:,} alunos</span></td>"
         )
         for sigla, bid in BIG_AREAS_ORDER:
@@ -3021,10 +3159,11 @@ with tab_qualidade:
 
     _CONTEUDOS_TABELA = [
         ("Aulas", aulas),
-        ("Comentários de questões", questoes),
+        ("Explicações de questões", questoes),
         ("E-book", ebook),
         ("Resumo", resumo),
         ("Mapa mental", mapa),
+        ("Material de apoio", apoio),
         ("Flashcards", flashcards),
     ]
 
@@ -3039,11 +3178,14 @@ with tab_qualidade:
     )
     _tabela_qualidade("".join(
         _render_qualidade_table(_slice_mes(d, _mes_oficial), lab,
-                                alunos_area=(lab == "Comentários de questões"),
+                                alunos_area=(lab == "Explicações de questões"),
                                 fonte_completa=d, ref=_mes_oficial)
         for lab, d in _CONTEUDOS_TABELA
     ))
-    if any((_r := _coleta_atipica(d, _mes_oficial)) is not None and _r[0] for _lab, d in _CONTEUDOS_TABELA):
+    if any(
+        (_r := detect_atypical_collection(d, _mes_oficial)) is not None and _r[0]
+        for _lab, d in _CONTEUDOS_TABELA
+    ):
         st.caption(
             "⚠️ Conteúdo(s) com volume de avaliações muito abaixo do histórico recente no mês oficial — "
             "possível falha de coleta; tratar a média como não comparável."
@@ -3062,7 +3204,7 @@ with tab_qualidade:
         # Sem flag de coleta atípica no mês parcial: n baixo aqui é só mês
         # incompleto, e o título já diz "(parcial, em andamento)".
         _tabela_qualidade("".join(
-            _render_qualidade_table(p, lab, alunos_area=(lab == "Comentários de questões"))
+            _render_qualidade_table(p, lab, alunos_area=(lab == "Explicações de questões"))
             for lab, p in _parciais.items()
         ))
         _baixos = [
@@ -3093,7 +3235,15 @@ with tab_qualidade:
             ["Mês a mês (isolado)", "Acumulado desde jan/26"],
             key="qualidade_modo",
         )
-    _CONTEUDOS_QUAL = ["Aulas", "Comentários de questões", "E-book", "Resumo", "Mapa mental", "Flashcards"]
+    _CONTEUDOS_QUAL = [
+        "Aulas",
+        "Explicações de questões",
+        "E-book",
+        "Resumo",
+        "Mapa mental",
+        "Material de apoio",
+        "Flashcards",
+    ]
     with _col_metricas:
         conteudos_sel = st.multiselect(
             "Conteúdos",
@@ -3135,10 +3285,11 @@ with tab_qualidade:
 
     _SOURCE_QUAL = {
         "Aulas": aulas,
-        "Comentários de questões": questoes,
+        "Explicações de questões": questoes,
         "E-book": ebook,
         "Resumo": resumo,
         "Mapa mental": mapa,
+        "Material de apoio": apoio,
         "Flashcards": flashcards,
     }
     series = pd.concat(
@@ -3154,11 +3305,12 @@ with tab_qualidade:
             labels={"mes": "Mês", "valor": "Média ★", "metrica": "Conteúdo"},
             color_discrete_map={
                 "Aulas": "#50BCFF",
-                "Comentários de questões": "#9500DB",
+                "Explicações de questões": "#9500DB",
                 "E-book": "#6CE190",
                 "Resumo": "#FFC805",
                 "Mapa mental": "#FF7013",
-                "Flashcards": "#6CE190",
+                "Material de apoio": "#8FA39D",
+                "Flashcards": "#B4F900",
             },
         )
         # Anotação do n em cada ponto
@@ -3177,6 +3329,245 @@ with tab_qualidade:
             xaxis=dict(tickformat="%b/%y"),
             legend=dict(orientation="h", yanchor="bottom", y=-0.25),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 
+# ============================================================
+# ABA VOZ DO ALUNO — feedback espontâneo, sem IA
+# ============================================================
+
+with tab_voz:
+    st.markdown("##### Voz do aluno")
+    st.caption(
+        "Feedbacks espontâneos de aulas, explicações de questões, "
+        "materiais e flashcards. Reportes de erro de flashcards não têm nota e "
+        "são tratados no fluxo de correção de conteúdo, fora desta aba."
+    )
+    st.info(
+        "Feedback espontâneo tem viés de autoseleção: responde quem decide avaliar, "
+        "muitas vezes após experiências muito boas ou ruins. Os percentuais descrevem "
+        "os registros recebidos, não representam todos os alunos."
+    )
+    st.warning(
+        "Uso interno. A sanitização automática remove identificadores comuns, mas "
+        "texto livre ainda pode conter nomes ou outros dados pessoais digitados pelo aluno."
+    )
+
+    try:
+        feedbacks = load_feedbacks_organicos()
+        feedbacks = _feedbacks_com_nota_valida(feedbacks)
+    except Exception as e:
+        st.error(f"Falha ao carregar feedbacks: {e}")
+        feedbacks = pd.DataFrame()
+
+    if feedbacks.empty:
+        st.info(
+            "Nenhum feedback no snapshot atual. A carga é diária — se persistir "
+            "por mais de um dia, verificar o ETL."
+        )
+    else:
+        feedbacks = feedbacks.copy()
+        feedbacks["data"] = pd.to_datetime(feedbacks["data"], errors="coerce")
+        feedbacks = feedbacks.dropna(subset=["data"])
+        feedbacks["mes"] = feedbacks["data"].dt.to_period("M").astype(str)
+
+        for coluna in ("segmento", "origem", "classificacao"):
+            feedbacks[coluna] = feedbacks[coluna].fillna("Não informado").astype(str)
+
+        segmentos = sorted(feedbacks["segmento"].unique())
+        origens = sorted(feedbacks["origem"].unique())
+        notas_opcoes = ["1", "2", "3", "4", "5"]
+        meses = sorted(feedbacks["mes"].unique(), reverse=True)
+
+        f_segmento, f_origem, f_nota, f_mes = st.columns(4)
+        with f_segmento:
+            segmentos_sel = st.multiselect(
+                "Segmento", segmentos, default=segmentos, key="voz_segmento"
+            )
+        with f_origem:
+            origens_sel = st.multiselect(
+                "Origem", origens, default=origens, key="voz_origem"
+            )
+        with f_nota:
+            notas_sel = st.multiselect(
+                "Nota",
+                notas_opcoes,
+                default=notas_opcoes,
+                key="voz_nota",
+            )
+        with f_mes:
+            mes_sel = st.selectbox(
+                "Mês",
+                [None, *meses],
+                format_func=lambda mes: "Todos" if mes is None else _format_mes(mes),
+                key="voz_mes",
+            )
+
+        base_kpi = feedbacks[
+            feedbacks["segmento"].isin(segmentos_sel)
+            & feedbacks["origem"].isin(origens_sel)
+        ].copy()
+        if mes_sel is not None:
+            base_kpi = base_kpi[base_kpi["mes"] == mes_sel]
+        notas_selecionadas = [int(nota) for nota in notas_sel]
+        filtrados = base_kpi[base_kpi["nota"].isin(notas_selecionadas)].copy()
+
+        tem_texto = filtrados["tem_texto"].fillna(False).astype(bool)
+        registros = len(filtrados)
+        comentarios = int(tem_texto.sum())
+        alunos = int(filtrados["aluno_hash"].nunique())
+        pct_criticos = _feedback_critical_pct(base_kpi)
+
+        k_registros, k_comentarios, k_alunos, k_criticos = st.columns(4)
+        k_registros.metric("Registros", f"{registros:,}")
+        k_comentarios.metric("Comentários", f"{comentarios:,}")
+        k_alunos.metric("Alunos com feedback", f"{alunos:,}")
+        k_criticos.metric(
+            "% críticos nas notas",
+            f"{pct_criticos:.1f}%",
+            help=(
+                "Notas 1 e 2 sobre o total de notas do recorte (segmento, origem e "
+                "mês). O filtro Nota não altera este percentual — ele descreve o "
+                "recorte inteiro."
+            ),
+        )
+
+        graf_notas, graf_mensal = st.columns([1, 2])
+        with graf_mensal:
+            st.markdown("###### Comentários por mês e origem")
+            comentarios_df = filtrados[tem_texto].copy()
+            if comentarios_df.empty:
+                st.info(
+                    "Sem comentários neste recorte. Amplie os filtros de segmento, "
+                    "origem, nota ou mês."
+                )
+            else:
+                comentarios_df["mes_data"] = (
+                    comentarios_df["data"].dt.to_period("M").dt.to_timestamp()
+                )
+                serie_comentarios = (
+                    comentarios_df.groupby(["mes_data", "origem"])
+                    .size()
+                    .rename("comentarios")
+                    .reset_index()
+                )
+                fig_comentarios = px.bar(
+                    serie_comentarios,
+                    x="mes_data",
+                    y="comentarios",
+                    color="origem",
+                    labels={
+                        "mes_data": "Mês",
+                        "comentarios": "Comentários",
+                        "origem": "Origem",
+                    },
+                )
+                fig_comentarios.update_layout(
+                    height=360,
+                    barmode="stack",
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    xaxis=dict(tickformat="%b/%y"),
+                    legend=dict(orientation="h", yanchor="bottom", y=-0.3),
+                )
+                st.plotly_chart(fig_comentarios, width="stretch")
+
+        with graf_notas:
+            st.markdown("###### Distribuição das notas")
+            notas = pd.to_numeric(filtrados["nota"], errors="coerce").dropna()
+            notas = notas[notas.between(1, 5)]
+            if notas.empty:
+                st.info(
+                    "Sem notas neste recorte. Amplie os filtros de segmento, origem, "
+                    "nota ou mês."
+                )
+            else:
+                dist_notas = (
+                    notas.astype(int)
+                    .value_counts()
+                    .reindex(range(1, 6), fill_value=0)
+                    .rename_axis("nota")
+                    .rename("registros")
+                    .reset_index()
+                )
+                fig_notas = px.bar(
+                    dist_notas,
+                    x="nota",
+                    y="registros",
+                    labels={"nota": "Nota", "registros": "Registros"},
+                    color_discrete_sequence=[EMR["approved"]],
+                )
+                fig_notas.update_layout(
+                    height=360,
+                    margin=dict(l=10, r=10, t=10, b=10),
+                    xaxis=dict(tickmode="array", tickvals=[1, 2, 3, 4, 5]),
+                    showlegend=False,
+                )
+                st.plotly_chart(fig_notas, width="stretch")
+
+        st.markdown("###### Feedbacks recentes")
+        busca = st.text_input(
+            "Buscar no texto, conteúdo, professor ou origem",
+            placeholder="Digite um termo…",
+            key="voz_busca",
+        ).strip()
+
+        feed = filtrados[tem_texto].copy()
+        feed["texto"] = (
+            feed["texto"].fillna("").astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
+        )
+        if "conteudo_id" not in feed.columns:
+            feed["conteudo_id"] = pd.NA
+        feed["conteudo_id"] = feed["conteudo_id"].replace("", pd.NA).fillna("—")
+        if busca:
+            colunas_busca = ["texto", "conteudo", "professor", "origem"]
+            haystack = (
+                feed[colunas_busca]
+                .fillna("")
+                .astype(str)
+                .agg(" ".join, axis=1)
+            )
+            feed = feed[haystack.str.contains(busca, case=False, regex=False)]
+
+        feed = feed.sort_values("data", ascending=False).head(500)
+        if feed.empty:
+            st.info("Nenhum comentário encontrado.")
+        else:
+            feed_publico = feed[
+                [
+                    "data",
+                    "segmento",
+                    "origem",
+                    "nota",
+                    "texto",
+                    "conteudo",
+                    "conteudo_id",
+                    "professor",
+                ]
+            ].rename(
+                columns={
+                    "data": "Data",
+                    "segmento": "Segmento",
+                    "origem": "Origem",
+                    "nota": "Nota",
+                    "texto": "Feedback",
+                    "conteudo": "Conteúdo",
+                    "conteudo_id": "ID",
+                    "professor": "Professor",
+                }
+            )
+            st.dataframe(
+                feed_publico,
+                hide_index=True,
+                width="stretch",
+                column_config={
+                    "Data": st.column_config.DatetimeColumn(format="DD/MM/YYYY"),
+                    "Feedback": st.column_config.TextColumn(width="large"),
+                    "Conteúdo": st.column_config.TextColumn(width="medium"),
+                },
+            )
+            st.caption(
+                f"{len(feed_publico):,} comentário(s) exibido(s), limitados aos "
+                "500 mais recentes. Textos sanitizados no ETL e exibidos sem HTML. "
+                "Para flashcards, a nota se refere ao baralho (deck), não a uma carta "
+                "individual — o ID exibido é o ID do deck."
+            )
