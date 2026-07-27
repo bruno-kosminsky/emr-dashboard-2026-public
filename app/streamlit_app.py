@@ -7,8 +7,9 @@ Foco: responder em 30s "onde a turma está hoje e pra onde está indo".
 
 from __future__ import annotations
 
+import hashlib
+import io
 import os
-import tempfile
 from pathlib import Path
 
 import pandas as pd
@@ -98,27 +99,26 @@ ROOT = Path(__file__).resolve().parent.parent
 SNAPSHOTS = ROOT / "snapshots"
 SNAPSHOTS_B2B_DIR = SNAPSHOTS / "b2b"
 
-# Repo privado e tag do release que hospeda os parquets.
+# Repo privado cujo último release publicado hospeda os parquets.
 DATA_REPO = "brunokosminsky-svg/emr-dashboard-2026"
-DATA_TAG = "latest-data"
 
 st.set_page_config(page_title="Dashboard EMR · R1 2026", layout="wide", initial_sidebar_state="collapsed")
 
 
+def _app_password_hash():
+    try:
+        password_hash = st.secrets.get("APP_PASSWORD_HASH")
+    except Exception:
+        password_hash = None
+    return password_hash or os.getenv("APP_PASSWORD_HASH")
+
+
 def _require_password() -> None:
     """Gate de senha única compartilhada. A senha (hash bcrypt) vive em
-    st.secrets["APP_PASSWORD_HASH"] no Streamlit Cloud — nunca no repositório.
-    Sem o secret, falha fechado. Desenvolvimento sem senha exige a opção local
-    explícita ALLOW_INSECURE_LOCAL=true."""
-    try:
-        pw_hash = st.secrets.get("APP_PASSWORD_HASH")
-    except Exception:
-        pw_hash = None
+    st.secrets["APP_PASSWORD_HASH"] no Streamlit Cloud ou na variável de ambiente
+    APP_PASSWORD_HASH em execução local/Docker. Sem hash, falha fechado."""
+    pw_hash = _app_password_hash()
     if not pw_hash:
-        allow_local = os.getenv("ALLOW_INSECURE_LOCAL", "").strip().lower()
-        if allow_local in {"1", "true", "yes"}:
-            st.warning("Modo local sem senha habilitado por ALLOW_INSECURE_LOCAL.")
-            return
         st.error("Configuração inválida: APP_PASSWORD_HASH não foi definido.")
         st.stop()
     if st.session_state.get("_authed"):
@@ -412,6 +412,7 @@ st.markdown(
       .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab"]:nth-child(2)::before {content: "🏥";}
       .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab"]:nth-child(3)::before {content: "📈";}
       .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab"]:nth-child(4)::before {content: "🎯";}
+      .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [data-baseweb="tab"]:nth-child(5)::before {content: "💬";}
       .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] [aria-selected="true"]::before {filter: none; opacity: 1;}
 
       /* --- KPI card (novo, coexiste com .hero-card legado) --- */
@@ -465,6 +466,39 @@ st.markdown(
       .donut-legend li span {width: 9px; height: 9px; border-radius: 3px; flex: 0 0 9px;}
       .donut-legend li b {margin-left: auto; color: var(--emr-text); font-weight: 600; font-variant-numeric: tabular-nums;}
 
+      /* === Callout "Análise automática" (classes de _ia_report) === */
+      .ia-report {
+        background: var(--emr-card-soft);
+        border: 1px solid var(--emr-line);
+        border-left: 3px solid var(--emr-approved, #6CE190);
+        border-radius: 12px;
+        padding: 14px 16px; margin: 8px 0 4px 0;
+      }
+      .ia-report p, .ia-report div {color: var(--emr-text);}
+      .ia-header {
+        font-size: 11px; font-weight: 600; text-transform: uppercase;
+        letter-spacing: 1.2px; color: var(--emr-approved, #6CE190); margin-bottom: 6px;
+      }
+      .ia-disclaimer {
+        font-size: 11.5px; color: var(--emr-text-muted); margin-top: 8px;
+      }
+
+      /* === Responsivo: sidebar fixa de 232px não cabe abaixo de 1024px === */
+      @media (max-width: 1024px) {
+        .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"] {
+          position: static; width: auto; flex-direction: row; align-items: center;
+          overflow-x: auto; padding: 10px 8px; gap: 4px;
+          border-right: none; border-bottom: 1px solid var(--emr-line);
+        }
+        .stMainBlockContainer > [data-testid="stVerticalBlock"] > .stTabs > div > div > [data-baseweb="tab-list"]::before {
+          display: none;
+        }
+        .emr-topbar {position: static; left: 0; padding: 0 20px;}
+        .block-container {
+          padding-left: 20px !important; padding-right: 20px !important;
+          padding-top: 12px !important;
+        }
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -511,6 +545,38 @@ def _feedbacks_com_nota_valida(feedbacks: pd.DataFrame) -> pd.DataFrame:
     return validos
 
 
+def _feedbacks_sem_nota(feedbacks: pd.DataFrame) -> pd.DataFrame:
+    """Mantém feedbacks espontâneos e reportes sem nota utilizável."""
+    if feedbacks.empty or "nota" not in feedbacks.columns:
+        return feedbacks.copy()
+    notas = pd.to_numeric(feedbacks["nota"], errors="coerce")
+    return feedbacks[~notas.isin([1, 2, 3, 4, 5])].copy()
+
+
+def _filter_feedbacks_by_theme(
+    feedbacks: pd.DataFrame,
+    tema: str | None,
+) -> pd.DataFrame:
+    """Filtra falas pela área da plataforma usada como tema."""
+    if tema is None:
+        return feedbacks.copy()
+    return feedbacks[feedbacks["conteudo"].eq(tema)].copy()
+
+
+def _feedbacks_para_exibicao(
+    feedbacks: pd.DataFrame,
+    *,
+    release_id: str | None,
+) -> pd.DataFrame:
+    """Texto sanitizado é exibido integralmente (política 2026-07-26: dashboard
+    interno com senha, sem revisão individual); identificador de conta nunca."""
+    seguros = feedbacks.copy()
+    if "texto" in seguros.columns:
+        seguros["texto"] = seguros["texto"].fillna("").astype(str)
+        seguros["tem_texto"] = seguros["texto"].str.len().gt(0)
+    return seguros.drop(columns=["account_id"], errors="ignore")
+
+
 def assign_safra(first_start: pd.Series) -> pd.Series:
     """Atribui safra de matrícula como 'YYYY-MM'.
 
@@ -531,10 +597,10 @@ PRESCRIPTION_COLORS = {
     "Sem acerto canônico": "#8FA39D",  # neutro derivado — ausência de dado, não julgamento
 }
 PRESCRIPTION_MEANING = {
-    "Excelência":          "acertou ≥ alvo Excelência no mock do mês",
-    "Proficiência":        "acertou ≥ alvo Proficiência no mock do mês",
-    "Abaixo do canal":     "fez mock mas ficou abaixo do alvo",
-    "Sem acerto canônico": "não fez mock no mês",
+    "Excelência":          "acertou ≥ alvo Excelência no simulado do mês",
+    "Proficiência":        "acertou ≥ alvo Proficiência no simulado do mês",
+    "Abaixo do canal":     "fez simulado mas ficou abaixo do alvo",
+    "Sem acerto canônico": "não fez simulado no mês",
 }
 
 
@@ -554,75 +620,161 @@ def _data_token() -> str | None:
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def _release_assets(token: str) -> dict[str, dict[str, str]]:
-    """Metadados dos assets do release privado, incluindo data real."""
+    """Metadados do release de dados mais recente (tag `data-*`).
+
+    Não usa /releases/latest: um release de código criado no repo viraria
+    "latest" e derrubaria o app (0 assets) — ou, na transição, serviria o
+    release antigo sem gate de allowlist como se fosse revisado.
+    """
     r = requests.get(
-        f"https://api.github.com/repos/{DATA_REPO}/releases/tags/{DATA_TAG}",
+        f"https://api.github.com/repos/{DATA_REPO}/releases?per_page=20",
         headers={"Authorization": f"token {token}",
                  "Accept": "application/vnd.github+json"},
         timeout=30,
     )
     r.raise_for_status()
+    for payload in r.json():
+        if payload.get("draft") or not str(payload.get("tag_name", "")).startswith("data-"):
+            continue
+        release_id = str(payload["id"])
+        return {
+            asset["name"]: {
+                "url": asset["url"],
+                "updated_at": asset["updated_at"],
+                "release_id": release_id,
+            }
+            for asset in payload.get("assets", [])
+        }
+    raise RuntimeError(
+        f"Nenhum release de dados (tag data-*) encontrado em {DATA_REPO}."
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _release_assets_for_id(
+    token: str,
+    release_id: str,
+) -> dict[str, dict[str, str]]:
+    """Metadados de uma versão imutável do release."""
+    r = requests.get(
+        f"https://api.github.com/repos/{DATA_REPO}/releases/{release_id}",
+        headers={"Authorization": f"token {token}",
+                 "Accept": "application/vnd.github+json"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    payload = r.json()
+    actual_release_id = str(payload["id"])
+    if actual_release_id != release_id:
+        raise RuntimeError(
+            f"Release solicitado {release_id}, recebido {actual_release_id}."
+        )
     return {
         asset["name"]: {
             "url": asset["url"],
             "updated_at": asset["updated_at"],
+            "release_id": actual_release_id,
         }
-        for asset in r.json().get("assets", [])
+        for asset in payload.get("assets", [])
     }
 
 
-def _release_asset_urls(token: str) -> dict[str, str]:
-    """Mapa asset_name → api_url, preservado para o downloader."""
-    return {name: data["url"] for name, data in _release_assets(token).items()}
-
-
-def _release_asset_snapshot_date(token: str, asset_name: str) -> pd.Timestamp:
+def _release_asset_snapshot_date(
+    token: str,
+    release_id: str,
+    asset_name: str,
+) -> pd.Timestamp:
     """Data do asset no release; nunca confunde hora do acesso com frescor."""
-    asset = _release_assets(token).get(asset_name)
+    asset = _release_assets_for_id(token, release_id).get(asset_name)
     if not asset or not asset.get("updated_at"):
         raise FileNotFoundError(f"Metadado ausente para o asset {asset_name}.")
     return pd.Timestamp(asset["updated_at"]).tz_convert("America/Sao_Paulo")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _fetch_data_file(asset_name: str) -> str | None:
-    """Baixa um asset do release privado para /tmp e retorna o caminho local.
-    Retorna None se não houver token (dev local cai no disco)."""
-    token = _data_token()
-    if not token:
-        return None
-    urls = _release_asset_urls(token)
-    if asset_name not in urls:
-        return None
+def _download_release_asset(
+    asset_name: str,
+    release_id: str,
+    asset_url: str,
+    token: str,
+) -> bytes:
+    """Baixa e cacheia um asset pela versão imutável do release."""
     r = requests.get(
-        urls[asset_name],
+        asset_url,
         headers={"Authorization": f"token {token}",
                  "Accept": "application/octet-stream"},
         timeout=120,
     )
     r.raise_for_status()
-    dst = Path(tempfile.gettempdir()) / f"emrdash_{asset_name}"
-    dst.write_bytes(r.content)
-    return str(dst)
+    return r.content
 
 
-def _read_parquet_source(asset_name: str, local_path: Path) -> pd.DataFrame:
+def _fetch_data_file(
+    asset_name: str,
+    release_id: str | None,
+) -> bytes | None:
+    """Baixa o asset de uma versão fixa; sem token, dev local cai no disco."""
+    token = _data_token()
+    if not token:
+        return None
+    if not release_id:
+        raise RuntimeError("Release remoto não foi fixado para esta execução.")
+    asset = _release_assets_for_id(token, release_id).get(asset_name)
+    if not asset:
+        raise FileNotFoundError(
+            f"Asset {asset_name} ausente no release {release_id}."
+        )
+    return _download_release_asset(
+        asset_name,
+        release_id,
+        asset["url"],
+        token,
+    )
+
+
+def _active_release_id() -> str | None:
+    """Identifica a versão remota usada nesta execução do app."""
+    token = _data_token()
+    if not token:
+        return None
+    release_ids = {
+        asset["release_id"]
+        for asset in _release_assets(token).values()
+    }
+    if len(release_ids) != 1:
+        raise RuntimeError("Release remoto sem versão única válida.")
+    return release_ids.pop()
+
+
+def _read_parquet_source(
+    asset_name: str,
+    local_path: Path,
+    release_id: str | None,
+) -> pd.DataFrame:
     """Lê um parquet: do release privado (se houver DATA_TOKEN) ou do disco (dev).
     DataFrame vazio se ausente em ambos."""
-    remote = _fetch_data_file(asset_name)
-    src = Path(remote) if remote else local_path
-    if not Path(src).exists():
+    remote = _fetch_data_file(asset_name, release_id)
+    if remote is not None:
+        return pd.read_parquet(io.BytesIO(remote))
+    if not local_path.exists():
         return pd.DataFrame()
-    return pd.read_parquet(src)
+    return pd.read_parquet(local_path)
 
 
-def _read_b2b_parquet(name: str) -> pd.DataFrame:
+def _read_b2b_parquet(
+    name: str,
+    release_id: str | None,
+) -> pd.DataFrame:
     """Lê um parquet B2B (release: prefixo 'b2b__'; disco: snapshots/b2b/)."""
-    return _read_parquet_source(f"b2b__{name}", SNAPSHOTS_B2B_DIR / name)
+    return _read_parquet_source(
+        f"b2b__{name}",
+        SNAPSHOTS_B2B_DIR / name,
+        release_id,
+    )
 
 
 def _normalize_canonico(d: pd.DataFrame) -> pd.DataFrame:
-    """Compat de esquema: o ETL B2C renomeou as colunas de acerto canônico para
+    """Compat de esquema: o ETL B2C renomeou as colunas de acerto em simulados para
     'm10_*'; o B2B e o app usam 'acerto_canonico_*'. Renomeia m10_* → canônico
     para o app funcionar com qualquer um dos dois esquemas."""
     ren = {
@@ -659,13 +811,30 @@ def _validate_snapshot_frames(
         )
 
 
-def load_snapshot(snap_dir: Path = SNAPSHOTS):
+@st.cache_data(ttl=900, show_spinner=False)
+def load_snapshot(
+    snap_dir: Path = SNAPSHOTS,
+    *,
+    release_id: str | None,
+):
     # B2C: asset do release com nome simples; B2B usa _read_b2b_parquet (prefixo b2b__).
     is_b2b = snap_dir == SNAPSHOTS_B2B_DIR
     pref = "b2b__" if is_b2b else ""
-    df = _normalize_canonico(_read_parquet_source(f"{pref}latest.parquet", snap_dir / "latest.parquet"))
-    cohort = _read_parquet_source(f"{pref}latest_cohort.parquet", snap_dir / "latest_cohort.parquet")
-    metrics = _normalize_canonico(_read_parquet_source(f"{pref}latest_cohort_metrics.parquet", snap_dir / "latest_cohort_metrics.parquet"))
+    df = _normalize_canonico(_read_parquet_source(
+        f"{pref}latest.parquet",
+        snap_dir / "latest.parquet",
+        release_id,
+    ))
+    cohort = _read_parquet_source(
+        f"{pref}latest_cohort.parquet",
+        snap_dir / "latest_cohort.parquet",
+        release_id,
+    )
+    metrics = _normalize_canonico(_read_parquet_source(
+        f"{pref}latest_cohort_metrics.parquet",
+        snap_dir / "latest_cohort_metrics.parquet",
+        release_id,
+    ))
     _validate_snapshot_frames(
         df,
         cohort,
@@ -682,7 +851,13 @@ def load_snapshot(snap_dir: Path = SNAPSHOTS):
     local = snap_dir / "latest.parquet"
     token = _data_token()
     if token:
-        snap_date = _release_asset_snapshot_date(token, f"{pref}latest.parquet")
+        if not release_id:
+            raise RuntimeError("Release remoto não foi fixado para esta execução.")
+        snap_date = _release_asset_snapshot_date(
+            token,
+            release_id,
+            f"{pref}latest.parquet",
+        )
     elif local.exists():
         snap_date = pd.Timestamp(local.resolve().stat().st_mtime, unit="s", tz="UTC").tz_convert("America/Sao_Paulo")
     else:
@@ -690,7 +865,10 @@ def load_snapshot(snap_dir: Path = SNAPSHOTS):
     return df, cohort, metrics, snap_date
 
 
-df, cohort, metrics_acum, snapshot_date = load_snapshot()
+ACTIVE_RELEASE_ID = _active_release_id()
+df, cohort, metrics_acum, snapshot_date = load_snapshot(
+    release_id=ACTIVE_RELEASE_ID,
+)
 
 # Turmas fora do dashboard B2C — trials não são pagantes (decisão 2026-07-13).
 # O ETL (queries/01_cohort.sql) também exclui na origem; este filtro defensivo
@@ -710,9 +888,19 @@ else:
 
 # Snapshot B2B paralelo (Inspirali, Mandic, FMO, Unisa, FACAPE, FARESI)
 SNAPSHOTS_B2B = SNAPSHOTS / "b2b"
+B2B_LOAD_ERROR: str | None = None
 try:
-    df_b2b, cohort_b2b, metrics_acum_b2b, snapshot_date_b2b = load_snapshot(SNAPSHOTS_B2B)
+    df_b2b, cohort_b2b, metrics_acum_b2b, snapshot_date_b2b = load_snapshot(
+        SNAPSHOTS_B2B,
+        release_id=ACTIVE_RELEASE_ID,
+    )
     HAS_B2B = True
+# RequestException herda de OSError: capturar antes, senão falha HTTP
+# transitória vira "snapshot não encontrado" (diagnóstico errado).
+except requests.RequestException as _e:
+    df_b2b = cohort_b2b = metrics_acum_b2b = snapshot_date_b2b = None
+    HAS_B2B = False
+    B2B_LOAD_ERROR = f"Falha de rede ao baixar dados B2B ({type(_e).__name__}). Recarregue a página."
 except (FileNotFoundError, OSError):
     df_b2b = cohort_b2b = metrics_acum_b2b = snapshot_date_b2b = None
     HAS_B2B = False
@@ -736,34 +924,63 @@ def _filter_by_accounts(df: pd.DataFrame, account_ids: tuple[int, ...]) -> pd.Da
 
 
 @st.cache_data(ttl=60 * 60, show_spinner="Carregando avaliações de aulas…")
-def load_avaliacoes_aulas(account_ids: tuple[int, ...]) -> pd.DataFrame:
+def load_avaliacoes_aulas(
+    account_ids: tuple[int, ...],
+    *,
+    release_id: str | None,
+) -> pd.DataFrame:
     """Avaliações de aulas (mes, big_area_id, rate, account_id) do parquet."""
-    return _filter_by_accounts(_read_b2b_parquet("avaliacoes_aulas.parquet"), account_ids)
+    return _filter_by_accounts(
+        _read_b2b_parquet("avaliacoes_aulas.parquet", release_id),
+        account_ids,
+    )
 
 
 @st.cache_data(ttl=60 * 60, show_spinner="Carregando avaliações de questões…")
-def load_avaliacoes_questoes(account_ids: tuple[int, ...]) -> pd.DataFrame:
+def load_avaliacoes_questoes(
+    account_ids: tuple[int, ...],
+    *,
+    release_id: str | None,
+) -> pd.DataFrame:
     """Avaliações de explicações de questões do parquet."""
-    return _filter_by_accounts(_read_b2b_parquet("avaliacoes_questoes.parquet"), account_ids)
+    return _filter_by_accounts(
+        _read_b2b_parquet("avaliacoes_questoes.parquet", release_id),
+        account_ids,
+    )
 
 
 @st.cache_data(ttl=60 * 60, show_spinner="Carregando avaliações de materiais…")
-def load_avaliacoes_materiais(account_ids: tuple[int, ...]) -> pd.DataFrame:
+def load_avaliacoes_materiais(
+    account_ids: tuple[int, ...],
+    *,
+    release_id: str | None,
+) -> pd.DataFrame:
     """Avaliações de materiais (inclui coluna tipo_material) do parquet."""
-    return _filter_by_accounts(_read_b2b_parquet("avaliacoes_materiais.parquet"), account_ids)
+    return _filter_by_accounts(
+        _read_b2b_parquet("avaliacoes_materiais.parquet", release_id),
+        account_ids,
+    )
 
 
 @st.cache_data(ttl=60 * 60, show_spinner="Carregando avaliações de flashcards…")
-def load_avaliacoes_flashcards(account_ids: tuple[int, ...]) -> pd.DataFrame:
+def load_avaliacoes_flashcards(
+    account_ids: tuple[int, ...],
+    *,
+    release_id: str | None,
+) -> pd.DataFrame:
     """Avaliações de decks de flashcards do parquet."""
-    return _filter_by_accounts(_read_b2b_parquet("avaliacoes_flashcards.parquet"), account_ids)
+    return _filter_by_accounts(
+        _read_b2b_parquet("avaliacoes_flashcards.parquet", release_id),
+        account_ids,
+    )
 
 
 @st.cache_data(ttl=60 * 60, show_spinner="Carregando feedbacks…")
-def load_feedbacks_organicos() -> pd.DataFrame:
+def load_feedbacks_organicos(*, release_id: str | None) -> pd.DataFrame:
     """Feedbacks sanitizados, sem identificador interno da conta."""
-    return _read_b2b_parquet("feedbacks_organicos.parquet").drop(
-        columns=["account_id"], errors="ignore"
+    return _feedbacks_para_exibicao(
+        _read_b2b_parquet("feedbacks_organicos.parquet", release_id),
+        release_id=release_id,
     )
 
 
@@ -793,7 +1010,7 @@ ENAMED_2026_EDICOES_FALLBACK: list[dict] = [
 
 
 @st.cache_data(ttl=60 * 60)
-def load_enamed_2026_templates() -> list[dict]:
+def load_enamed_2026_templates(*, release_id: str | None) -> list[dict]:
     """Edições de simulados institucionais ENAMED 2026, do parquet pré-calculado
     (enamed_templates.parquet), em ordem cronológica.
 
@@ -801,7 +1018,7 @@ def load_enamed_2026_templates() -> list[dict]:
     antigo (1 linha por template, sem edicao_id) — cobre a janela de cache de
     até 1h entre o deploy do app e a regeneração do release de dados.
     """
-    df = _read_b2b_parquet("enamed_templates.parquet")
+    df = _read_b2b_parquet("enamed_templates.parquet", release_id)
     if df.empty:
         return [dict(e) for e in ENAMED_2026_EDICOES_FALLBACK]
     if "edicao_id" not in df.columns:  # schema antigo (pré 2026-07-13)
@@ -819,14 +1036,21 @@ def load_enamed_2026_templates() -> list[dict]:
 
 
 @st.cache_data(ttl=60 * 60)
-def load_enamed_2026_results(account_ids: tuple[int, ...]) -> pd.DataFrame:
+def load_enamed_2026_results(
+    account_ids: tuple[int, ...],
+    *,
+    release_id: str | None,
+) -> pd.DataFrame:
     """Resultados ENAMED 2026 por aluno, do parquet pré-calculado
     (enamed_results.parquet), filtrados pelos account_ids do grupo.
 
     Colunas: account_id, mock_template_id, question_count, acertos, pct
     (+ edicao_id no schema novo; 1 linha por aluno por edição — 1ª tentativa).
     """
-    return _filter_by_accounts(_read_b2b_parquet("enamed_results.parquet"), account_ids)
+    return _filter_by_accounts(
+        _read_b2b_parquet("enamed_results.parquet", release_id),
+        account_ids,
+    )
 
 
 # Mínimo de mock-takers num mês pra confiar nos percentis e recalibrar o canal.
@@ -876,10 +1100,16 @@ for _mes, _vals in _canais_novos.items():
     PRESCRIPTION_MONTHLY[_mes].update(_vals)
 
 
+def _stable_percentage(value):
+    if isinstance(value, pd.Series):
+        return pd.to_numeric(value, errors="coerce").round(10)
+    return round(float(value), 10)
+
+
 def classify(acerto_canonico_pct: float, mes: str) -> str:
     if pd.isna(acerto_canonico_pct):
         return "Sem acerto canônico"
-    acerto_canonico_pct = round(float(acerto_canonico_pct), 10)
+    acerto_canonico_pct = _stable_percentage(acerto_canonico_pct)
     t = PRESCRIPTION_MONTHLY[mes]
     if acerto_canonico_pct >= t["excel_min"]:
         return "Excelência"
@@ -1054,27 +1284,27 @@ def narrativa_faixas(cur_counts, prev_counts, total, cur_mes_label, prev_mes_lab
                 partes.append(f"a fatia em Excelência <strong>{sinal} {abs(d_excel):.1f}pp</strong>")
             if abs(d_engaj) >= 0.5:
                 sinal = "cresceu" if d_engaj > 0 else "recuou"
-                partes.append(f"o engajamento no mock canônico <strong>{sinal} {abs(d_engaj):.1f}pp</strong>")
+                partes.append(f"o engajamento nos simulados <strong>{sinal} {abs(d_engaj):.1f}pp</strong>")
             tendencia = f"Em relação a {prev_mes_label}, {' e '.join(partes)}."
     else:
         tendencia = "Não há mês anterior fechado para servir de baseline — a leitura é estática."
 
     if sem_mock >= 60:
         alerta = (
-            f"O <strong>engajamento crítico</strong> ({sem_mock:.0f}% sem mock canônico) "
+            f"O <strong>engajamento crítico</strong> ({sem_mock:.0f}% sem simulado completo) "
             "é o sinal mais forte do quadro: a maioria da turma não está sendo "
             "avaliada no canal e qualquer leitura sobre aproveitamento fica enviesada "
             "para os engajados."
         )
     elif sem_mock >= 40:
         alerta = (
-            f"O <strong>engajamento moderado</strong> ({sem_mock:.0f}% sem mock canônico) "
+            f"O <strong>engajamento moderado</strong> ({sem_mock:.0f}% sem simulado completo) "
             "limita a fração da turma que pode ser plenamente classificada — "
             "interpretar Excel/Profic como % do engajado pode mudar a leitura."
         )
     else:
         alerta = (
-            f"O engajamento está saudável (apenas {sem_mock:.0f}% sem mock canônico), "
+            f"O engajamento está saudável (apenas {sem_mock:.0f}% sem simulado completo), "
             "então as fatias Excel/Profic/Abaixo refletem bem a turma como um todo."
         )
 
@@ -1083,12 +1313,12 @@ def narrativa_faixas(cur_counts, prev_counts, total, cur_mes_label, prev_mes_lab
         f"{_diag_faixa_dominante(pct[dominante], dominante)}, com "
         f"<strong>{excel_pct:.0f}% em Excelência</strong>, "
         f"<strong>{prof_pct:.0f}% em Proficiência</strong> e "
-        f"<strong>{abaixo_pct:.0f}% abaixo do canal</strong> entre os que fizeram mock canônico. "
+        f"<strong>{abaixo_pct:.0f}% abaixo da meta</strong> entre os que fizeram simulado. "
         f"{tendencia} "
         f"{alerta} "
         f"O foco operacional natural é converter a base de <strong>Proficiência</strong> "
         f"em Excelência (intervenção de qualidade) e resgatar parte dos "
-        f"<strong>{sem_mock:.0f}% sem mock</strong> de volta ao canal (intervenção de engajamento) — "
+        f"<strong>{sem_mock:.0f}% sem simulado</strong> de volta ao ritmo (intervenção de engajamento) — "
         f"ambas alavancam o indicador de Excelência no próximo mês fechado.</p>"
     )
     return _ia_report(body)
@@ -1145,7 +1375,7 @@ def narrativa_gap(cur_per, cur_per_ativos, n_ativos, total, cur_targets, dimensi
         f"No agregado, das {len(items)} dimensões medidas, "
         f"<strong>{n_em_excel} atinge(m) Excelência</strong>, "
         f"<strong>{n_em_prof} fica(m) em Proficiência</strong> e "
-        f"<strong>{n_abaixo} ainda está(ão) abaixo do canal</strong>. "
+        f"<strong>{n_abaixo} ainda está(ão) abaixo da meta</strong>. "
         f"A leitura sugere intervenções focadas na dimensão de pior gap, "
         f"e não esforço distribuído homogeneamente entre todas as métricas.</p>"
     )
@@ -1160,30 +1390,31 @@ def narrativa_scatter(scatter_df, ref_canal, cur_mes_label, cohort_total):
     n = len(scatter_df)
     if n == 0:
         return _ia_report(
-            "<p>Não há alunos com acerto canônico calculado neste recorte para alimentar o mapa.</p>"
+            "<p>Não há alunos com acerto em simulado calculado neste recorte para alimentar o mapa.</p>"
         )
     excel_min = ref_canal["excel_min"]
     prof_min = ref_canal["prof_min"]
     q_med = float(scatter_df["questoes"].median())
+    acerto = _stable_percentage(scatter_df["acerto_canonico_pct"])
 
-    upper_left = ((scatter_df["acerto_canonico_pct"] >= excel_min) & (scatter_df["questoes"] < q_med)).sum()
-    upper_right = ((scatter_df["acerto_canonico_pct"] >= excel_min) & (scatter_df["questoes"] >= q_med)).sum()
-    lower_right = ((scatter_df["acerto_canonico_pct"] < prof_min) & (scatter_df["questoes"] >= q_med)).sum()
-    lower_left = ((scatter_df["acerto_canonico_pct"] < prof_min) & (scatter_df["questoes"] < q_med)).sum()
+    upper_left = ((acerto >= excel_min) & (scatter_df["questoes"] < q_med)).sum()
+    upper_right = ((acerto >= excel_min) & (scatter_df["questoes"] >= q_med)).sum()
+    lower_right = ((acerto < prof_min) & (scatter_df["questoes"] >= q_med)).sum()
+    lower_left = ((acerto < prof_min) & (scatter_df["questoes"] < q_med)).sum()
     meio = n - upper_left - upper_right - lower_right - lower_left
     pct_plotado = n / cohort_total * 100
 
     body = (
         f"<p>O mapa plota <strong>{n:,} alunos</strong> "
-        f"({pct_plotado:.0f}% do cohort) que tinham acerto canônico calculável — "
-        f"os ausentes não fizeram mock TEMPLATE ≥50q. "
+        f"({pct_plotado:.0f}% do cohort) que tinham acerto em simulado calculável — "
+        f"os ausentes não fizeram simulado completo (50+ questões). "
         f"Acima da linha de Excelência ({excel_min}%), encontram-se <strong>{upper_right:,} alunos "
         f"de alto volume + alto acerto</strong> (canto superior-direito, perfil já consolidado) "
         f"e <strong>{upper_left:,} alunos de baixo volume + alto acerto</strong> "
         f"(canto superior-esquerdo, talentos com potencial subutilizado — alvo claro de intervenção "
         f"para empurrar volume). "
         f"No canto inferior-direito há <strong>{lower_right:,} alunos com volume alto e acerto "
-        f"abaixo do canal</strong> — esforço significativo sem retorno, indicando problema de método "
+        f"abaixo da meta</strong> — esforço significativo sem retorno, indicando problema de método "
         f"e não de dedicação. "
         f"A massa concentrada no quadrante inferior-esquerdo ({lower_left:,} alunos) e na zona neutra "
         f"({meio:,}) representa o grupo mais difícil de mover, exigindo combinação de engajamento e "
@@ -1224,46 +1455,47 @@ def narrativa_trajetoria(pivot, months_closed):
 
     body = (
         f"<p>Entre <strong>{primeiro_label}</strong> e <strong>{ultimo_label}</strong>, "
-        f"a fatia em Excelência {diag_excel}, enquanto a fatia 'Sem acerto canônico' {diag_sem}. "
+        f"a fatia em Excelência {diag_excel}, enquanto a fatia 'Não fez simulado' {diag_sem}. "
         f"A Proficiência variou {d_prof:+.1f}pp no mesmo intervalo, indicando que o trânsito "
         f"entre faixas não foi apenas dentro do grupo engajado — boa parte da dinâmica vem da entrada "
-        f"e saída do próprio engajamento no mock canônico. "
+        f"e saída do próprio engajamento nos simulados. "
         f"No mês mais recente da janela, {excel_atual:.0f}% estão em Excelência e {abaixo_atual:.0f}% "
-        f"estão abaixo do canal, o que define o tamanho relativo da oportunidade de promoção (subir "
-        f"Profic→Excel) versus a de remediação (resgatar 'Abaixo' e 'Sem mock'). "
+        f"estão abaixo da meta, o que define o tamanho relativo da oportunidade de promoção (subir "
+        f"Profic→Excel) versus a de remediação (resgatar 'Abaixo da meta' e 'Sem simulado'). "
         f"A leitura combinada das duas tendências separa um problema de <em>aproveitamento</em> "
         f"(quando Excel cai com engajamento constante) de um problema de <em>engajamento</em> "
-        f"(quando Sem mock sobe arrastando todas as faixas para baixo).</p>"
+        f"(quando o grupo sem simulado cresce arrastando todas as faixas para baixo).</p>"
     )
     return _ia_report(body)
 
 
 def narrativa_canal_acerto(ac_df, total):
     if ac_df.empty:
-        return _ia_report("<p>Sem dados mensais de acerto canônico no recorte.</p>")
+        return _ia_report("<p>Sem dados mensais de acerto no recorte.</p>")
     primeiro = ac_df.iloc[0]
     ultimo = ac_df.iloc[-1]
     delta_med = ultimo["mediana_turma"] - primeiro["mediana_turma"]
     delta_n = ultimo["n_com_mock"] - primeiro["n_com_mock"]
     pct_engaj_atual = ultimo["n_com_mock"] / total * 100
     pct_engaj_ini = primeiro["n_com_mock"] / total * 100
+    mediana_turma = _stable_percentage(ultimo["mediana_turma"])
 
-    if ultimo["mediana_turma"] >= ultimo["excel_min"]:
+    if mediana_turma >= ultimo["excel_min"]:
         posicao = (
             f"<strong>dentro do canal Excelência v2</strong> "
             f"({ultimo['excel_min']}–{ultimo['excel_max']}%)"
         )
-    elif ultimo["mediana_turma"] >= ultimo["prof_min"]:
+    elif mediana_turma >= ultimo["prof_min"]:
         posicao = (
             f"<strong>dentro do canal Proficiência v2</strong> "
             f"({ultimo['prof_min']}–{ultimo['prof_max']}%), "
-            f"a {ultimo['excel_min'] - ultimo['mediana_turma']:.1f}pp de entrar no canal Excelência v2"
+            f"a {ultimo['excel_min'] - mediana_turma:.1f}pp de entrar no canal Excelência v2"
         )
     else:
         posicao = (
-            f"<strong>abaixo do canal Proficiência v2</strong> "
+            f"<strong>abaixo da meta de Proficiência</strong> "
             f"(piso {ultimo['prof_min']}%), com gap de "
-            f"{ultimo['prof_min'] - ultimo['mediana_turma']:.1f}pp pra entrar no canal"
+            f"{ultimo['prof_min'] - mediana_turma:.1f}pp pra entrar no canal"
         )
 
     if delta_med > 3:
@@ -1274,25 +1506,25 @@ def narrativa_canal_acerto(ac_df, total):
         evol = f"oscilou pouco ({delta_med:+.1f}pp), mantendo-se estável"
 
     body = (
-        f"<p>A mediana de acerto canônico da turma R1 2026 fechou o último mês em "
+        f"<p>O acerto típico (mediana) da turma nos simulados R1 2026 fechou o último mês em "
         f"<strong>{ultimo['mediana_turma']:.1f}%</strong>, posicionando-se {posicao}. "
-        f"A trajetória {evol}, sugerindo que o mock canônico — quando feito — "
+        f"A trajetória {evol}, sugerindo que o simulado — quando feito — "
         f"está {'evoluindo na direção certa' if delta_med > 0 else 'estagnado ou regredindo'} "
         f"em comparação com a referência histórica de 2025. "
-        f"O número de alunos que efetivamente fizeram mock canônico saiu de "
+        f"O número de alunos que efetivamente fizeram simulado saiu de "
         f"<strong>{int(primeiro['n_com_mock'])}</strong> ({pct_engaj_ini:.0f}% do cohort) para "
         f"<strong>{int(ultimo['n_com_mock'])}</strong> ({pct_engaj_atual:.0f}%), variação de "
         f"{delta_n:+.0f} alunos no engajamento ao canal. "
         f"O ponto crítico é que a mediana é calculada apenas entre os ~{pct_engaj_atual:.0f}% engajados "
         f"— se o objetivo é projetar performance da turma toda, ainda é preciso multiplicar "
-        f"esse aproveitamento pela taxa de adesão ao mock canônico, hoje o maior bottleneck.</p>"
+        f"esse aproveitamento pela adesão aos simulados, hoje o maior gargalo.</p>"
     )
     return _ia_report(body)
 
 
 def narrativa_safra_excel(safra_df, ref_label):
     if safra_df.empty:
-        return _ia_report("<p>Sem dados de safra disponíveis.</p>")
+        return _ia_report("<p>Sem dados por mês de entrada.</p>")
     s = safra_df.reset_index(drop=True)
     maior = s.loc[s["pct_excelencia"].idxmax()]
     menor = s.loc[s["pct_excelencia"].idxmin()]
@@ -1302,50 +1534,49 @@ def narrativa_safra_excel(safra_df, ref_label):
 
     if delta >= 8:
         gradiente = (
-            f"O gradiente é <strong>claro e esperado</strong>: a safra mais antiga "
-            f"({primeira['safra_label']}, {primeira['pct_excelencia']:.0f}%) supera a mais recente "
-            f"({ultima['safra_label']}, {ultima['pct_excelencia']:.0f}%) em {delta:.1f}pp, "
-            "compatível com a hipótese de que tempo de plataforma ajuda no aproveitamento"
+            f"A diferença é <strong>clara e esperada</strong>: quem entrou em "
+            f"{primeira['safra_label']} ({primeira['pct_excelencia']:.0f}%) supera quem entrou em "
+            f"{ultima['safra_label']} ({ultima['pct_excelencia']:.0f}%) por {delta:.1f} pontos — "
+            "compatível com a ideia de que mais tempo de plataforma melhora o resultado"
         )
     elif delta >= 2:
         gradiente = (
-            f"O gradiente é <strong>fraco</strong> ({delta:.1f}pp entre safra mais antiga e mais nova): "
-            "tempo de plataforma agrega pouco no aproveitamento — ou o método não escala com o uso, "
-            "ou as safras novas estão entrando mais bem preparadas"
+            f"A diferença é <strong>pequena</strong> ({delta:.1f} pontos entre o grupo mais antigo e o mais novo): "
+            "tempo de plataforma está agregando pouco — ou o método não escala com o uso, "
+            "ou os grupos novos estão entrando mais bem preparados"
         )
     elif delta >= -2:
         gradiente = (
-            f"O gradiente é <strong>praticamente plano</strong> ({delta:+.1f}pp), "
-            "indicando que estar há mais tempo na plataforma não está se traduzindo em "
-            "vantagem de aproveitamento — sinal forte para revisar a curva de aprendizado"
+            f"A diferença é <strong>praticamente nula</strong> ({delta:+.1f} pontos): "
+            "estar há mais tempo na plataforma não está virando vantagem de resultado — "
+            "sinal forte para revisar a curva de aprendizado"
         )
     else:
         gradiente = (
-            f"O gradiente está <strong>invertido</strong> ({delta:+.1f}pp): safras mais recentes "
-            "performam melhor que as antigas no canal de acerto — algo no produto ou no perfil "
-            "mudou recentemente, e quem estava antes não está capturando o ganho"
+            f"A relação está <strong>invertida</strong> ({delta:+.1f} pontos): grupos mais recentes "
+            "acertam mais que os antigos — algo no produto ou no perfil de quem entra "
+            "mudou recentemente, e quem estava antes não capturou o ganho"
         )
 
     body = (
-        f"<p>Tomando <strong>{ref_label}</strong> como referência, a melhor safra é a de "
-        f"<strong>{maior['safra_label']}</strong> com {maior['pct_excelencia']:.0f}% em Excelência "
-        f"(n={int(maior['total'])}), enquanto a pior é a de <strong>{menor['safra_label']}</strong> "
+        f"<p>Tomando <strong>{ref_label}</strong> como referência, o melhor grupo é o que entrou em "
+        f"<strong>{maior['safra_label']}</strong>, com {maior['pct_excelencia']:.0f}% dos alunos em Excelência "
+        f"(n={int(maior['total'])}); o mais fraco é o de <strong>{menor['safra_label']}</strong>, "
         f"com {menor['pct_excelencia']:.0f}% (n={int(menor['total'])}). "
         f"{gradiente}. "
-        f"A leitura ganha peso ao notar que a massa do cohort está concentrada em "
-        f"<strong>{primeira['safra_label']}</strong> ({int(primeira['total'])} alunos), "
-        f"de modo que a performance dessa safra arrasta o agregado e qualquer intervenção "
-        f"tem maior alavancagem ali. "
-        f"Combinada com a leitura do gráfico de volume logo abaixo, dá pra separar se o problema "
-        f"é de <em>aproveitamento</em> (faz volume, não vira Excel) ou de <em>volume</em> "
-        f"(não faz o suficiente pra ter chance de virar Excel) em cada safra.</p>"
+        f"Vale lembrar que a maior parte da turma entrou em "
+        f"<strong>{primeira['safra_label']}</strong> ({int(primeira['total'])} alunos) — o desempenho "
+        f"desse grupo puxa o número geral, e qualquer intervenção rende mais ali. "
+        f"Combinando com o gráfico de volume logo abaixo, dá pra separar se o problema de cada grupo "
+        f"é de <em>aproveitamento</em> (estuda bastante, mas não acerta o suficiente) ou de "
+        f"<em>volume</em> (não estuda o suficiente pra ter chance).</p>"
     )
     return _ia_report(body)
 
 
 def narrativa_safra_volume(vol_df, ref_label, safra_acerto_df):
     if vol_df.empty:
-        return _ia_report("<p>Sem dados de safra disponíveis.</p>")
+        return _ia_report("<p>Sem dados por mês de entrada.</p>")
     v = vol_df.reset_index(drop=True)
     maior = v.loc[v["pct_excel"].idxmax()]
     menor = v.loc[v["pct_excel"].idxmin()]
@@ -1365,41 +1596,40 @@ def narrativa_safra_volume(vol_df, ref_label, safra_acerto_df):
         maior_gap_vol = max(comp_lines, key=lambda x: x[3])
         if maior_gap_vol[3] > 5:
             comp = (
-                f"A safra de <strong>{maior_gap_vol[0]}</strong> apresenta o maior descolamento "
-                f"entre volume e aproveitamento ({maior_gap_vol[1]:.0f}% atinge volume Excel "
-                f"vs apenas {maior_gap_vol[2]:.0f}% em Excel no acerto canônico, gap de "
-                f"{maior_gap_vol[3]:.0f}pp) — esforço alto sem retorno proporcional, "
-                f"caso clássico para revisar método de estudo, não dedicação"
+                f"O grupo que entrou em <strong>{maior_gap_vol[0]}</strong> tem o maior descolamento "
+                f"entre esforço e resultado: {maior_gap_vol[1]:.0f}% estudam o volume recomendado, "
+                f"mas só {maior_gap_vol[2]:.0f}% estão em Excelência no acerto "
+                f"({maior_gap_vol[3]:.0f} pontos de diferença) — esforço alto sem retorno "
+                f"proporcional, caso clássico para revisar o método de estudo, não a dedicação"
             )
         else:
             comp = (
-                "As taxas de volume e aproveitamento estão razoavelmente alinhadas entre safras "
-                "— quem faz o volume prescrito também tende a colher o aproveitamento esperado"
+                "Esforço e resultado estão razoavelmente alinhados entre os grupos "
+                "— quem estuda o volume recomendado também tende a colher o acerto esperado"
             )
     else:
-        comp = "Sem dados suficientes para comparar volume vs aproveitamento por safra"
+        comp = "Sem dados suficientes para comparar esforço e resultado por mês de entrada"
 
     body = (
-        f"<p>Olhando para o volume acumulado B+Q+F (blocos+questões+flashcards) de cada aluno "
-        f"desde o mês de matrícula até <strong>{ref_label}</strong>, a melhor safra em "
-        f"aderência ao volume Excelência é <strong>{maior['safra_label']}</strong> com "
-        f"<strong>{maior['pct_excel']:.0f}%</strong> dos alunos atingindo o target acumulado "
-        f"(n={int(maior['total'])}), enquanto a mais distante é <strong>{menor['safra_label']}</strong> "
-        f"({menor['pct_excel']:.0f}%, n={int(menor['total'])}). "
-        f"A safra <strong>{primeira['safra_label']}</strong> tem mediana de "
-        f"<strong>{int(primeira['mediana_bqf']):,}</strong> atividades acumuladas vs target "
-        f"Excel de {int(primeira['target_excel']):,} — a distância entre a mediana e o target "
-        f"dá a magnitude do esforço típico de quem é mediano na safra. "
+        f"<p>Somando aulas, questões e flashcards de cada aluno desde a matrícula até "
+        f"<strong>{ref_label}</strong>: o grupo que mais cumpre o volume recomendado é o de "
+        f"<strong>{maior['safra_label']}</strong>, com <strong>{maior['pct_excel']:.0f}%</strong> "
+        f"dos alunos no ritmo de Excelência (n={int(maior['total'])}); o mais distante é o de "
+        f"<strong>{menor['safra_label']}</strong> ({menor['pct_excel']:.0f}%, n={int(menor['total'])}). "
+        f"No grupo de <strong>{primeira['safra_label']}</strong>, o aluno típico acumulou "
+        f"<strong>{int(primeira['mediana_bqf']):,}</strong> atividades, contra "
+        f"{int(primeira['target_excel']):,} recomendadas — essa distância mostra o tamanho do "
+        f"esforço que falta para o aluno mediano. "
         f"{comp}. "
-        f"Esse gráfico complementa o de aproveitamento logo acima ao separar a pergunta "
-        f"<em>'a turma está estudando o suficiente?'</em> da pergunta "
-        f"<em>'a turma está estudando bem?'</em> — fundamentais para priorizar intervenção entre "
-        f"engajamento (volume) e qualidade (método).</p>"
+        f"Este gráfico separa a pergunta <em>“a turma está estudando o suficiente?”</em> da "
+        f"pergunta <em>“a turma está estudando bem?”</em> (o gráfico de acerto acima) — juntas, "
+        f"elas dizem se a intervenção prioritária é de engajamento ou de método.</p>"
     )
     return _ia_report(
         body,
-        disclaimer="B+Q+F soma unidades diferentes sem ponderação. Útil como proxy de volume "
-        "agregado de atividade, mas inadequado para comparar mix de estudo entre alunos.",
+        disclaimer="A soma junta atividades de naturezas diferentes (aula, questão, flashcard) "
+        "sem ponderação — boa pra medir volume total, inadequada pra comparar o mix de estudo "
+        "entre alunos.",
     )
 
 
@@ -1443,13 +1673,13 @@ def narrativa_matriz(cm_n, cm_pct, cm_total):
         f"<p>Restringindo aos <strong>{cm_total:,} alunos Q1/26</strong>, "
         f"dos <strong>{n_seg_excel:,}</strong> que estão seguindo o volume prescrito de "
         f"Excelência, apenas <strong>{ex_to_ex:.0f}%</strong> colheram Excelência no acerto "
-        f"canônico do mês — {diag_excel}. "
+        f"do mês — {diag_excel}. "
         f"Outros <strong>{ex_to_below:.0f}%</strong> caíram para Abaixo do canal mesmo com "
-        f"volume alto, e <strong>{ex_to_nomock:.0f}%</strong> sequer fizeram mock canônico "
+        f"volume alto, e <strong>{ex_to_nomock:.0f}%</strong> sequer fizeram simulado completo "
         f"(volume alto sem avaliação no canal — risco de overconfidence). "
         f"No extremo oposto, dos <strong>{n_seg_abaixo:,}</strong> alunos abaixo da prescrição, "
         f"<strong>{abaixo_to_ex:.0f}%</strong> ainda atingiram Excelência (talento ou método "
-        f"excepcional) e <strong>{abaixo_to_nomock:.0f}%</strong> não fizeram mock canônico — "
+        f"excepcional) e <strong>{abaixo_to_nomock:.0f}%</strong> não fizeram simulado completo — "
         f"este último é o grupo prioritário de resgate, pois combina baixo volume e nenhuma "
         f"avaliação. "
         f"Ressalva metodológica importante: a matriz mede volume e resultado no <em>mesmo</em> "
@@ -1513,14 +1743,14 @@ def narrativa_leadlag(ll_n, ll_pct, ll_total, ll_pairs, cm_pct):
         f"{len(ll_pairs)} pares Q1/26 disponíveis, totalizando "
         f"<strong>{ll_total:,} observações</strong>, das "
         f"<strong>{n_seg_excel:,}</strong> em que o aluno seguiu volume de Excelência no mês N, "
-        f"<strong>{ll_ex_to_ex:.0f}%</strong> estavam em Excelência no acerto canônico do mês "
+        f"<strong>{ll_ex_to_ex:.0f}%</strong> estavam em Excelência no acerto em simulados do mês "
         f"seguinte — {cmp}. "
-        f"Outros <strong>{ll_ex_to_nomock:.0f}%</strong> que fizeram o volume não fizeram mock "
+        f"Outros <strong>{ll_ex_to_nomock:.0f}%</strong> que fizeram o volume não fizeram simulado "
         f"canônico no mês seguinte (desengajamento da avaliação mesmo com esforço continuado). "
         f"Dos <strong>{n_seg_abaixo:,}</strong> alunos que ficaram abaixo da prescrição, "
-        f"<strong>{ll_abaixo_to_nomock:.0f}%</strong> também sumiram do mock canônico em N+1 — "
+        f"<strong>{ll_abaixo_to_nomock:.0f}%</strong> também sumiram do simulado completo em N+1 — "
         f"comportamento consistente com saída gradual do engajamento (baixo volume hoje vira "
-        f"nenhum mock amanhã). "
+        f"nenhum simulado amanhã). "
         f"Limitação metodológica: o lead-lag reduz mas não elimina viés de seleção, pois alunos "
         f"que persistem na plataforma de N para N+1 já estão filtrados por engajamento — "
         f"a comparação correta seria contrafactual, e ela não está disponível aqui.</p>"
@@ -1670,10 +1900,10 @@ def _render_agora_now(
     st.markdown("&nbsp;")
     _ch = PRESCRIPTION_MONTHLY[cur_mes]
     _meaning_dyn = {
-        "Excelência":          f"acertou ≥{_ch['excel_min']}% no mock de {cur_mes_label}",
-        "Proficiência":        f"acertou ≥{_ch['prof_min']}% e <{_ch['excel_min']}% no mock de {cur_mes_label}",
-        "Abaixo do canal":     f"acertou <{_ch['prof_min']}% no mock de {cur_mes_label}",
-        "Sem acerto canônico": f"não fez mock canônico em {cur_mes_label}",
+        "Excelência":          f"acertou {_ch['excel_min']}% ou mais no simulado de {cur_mes_label}",
+        "Proficiência":        f"acertou entre {_ch['prof_min']}% e {_ch['excel_min']}% no simulado de {cur_mes_label}",
+        "Abaixo do canal":     f"acertou menos de {_ch['prof_min']}% no simulado de {cur_mes_label}",
+        "Sem acerto canônico": f"não fez simulado completo em {cur_mes_label}",
     }
     _pcts = {
         f: cur_counts[f] / cur_total * 100 if cur_total else 0.0
@@ -1741,7 +1971,7 @@ def _render_agora_now(
     st.caption(
         f"Alvos {cur_mes_label}: Proficiência ≥{_ch['prof_min']}% · "
         f"Excelência ≥{_ch['excel_min']}% de acerto no mock. "
-        f"Sem acerto canônico: {_meaning_dyn['Sem acerto canônico']}."
+        f"Não fez simulado: {_meaning_dyn['Sem acerto canônico']}."
     )
 
     # --- Questões por aluno/semana: média e mediana do grupo filtrado.
@@ -1914,9 +2144,11 @@ def _render_agora_now(
 
     # --- Bloco 3: scatter acionável ---
     st.markdown("&nbsp;")
-    st.markdown("##### Mapa da turma — Questões × Acerto")
+    st.markdown("##### Mapa da turma — cada ponto é um aluno")
     st.caption(
-        "Cada ponto é 1 aluno. Posição = acumulado; cor e pisos = faixa do último mês fechado."
+        "Posição do ponto = questões respondidas e % de acerto acumulados no ano. "
+        "Cor = faixa de desempenho no último mês fechado. As linhas horizontais "
+        "marcam os pisos de acerto das faixas."
     )
 
     scatter_df = metrics_df.merge(
@@ -1938,7 +2170,7 @@ def _render_agora_now(
         },
         labels={
             "questoes": "Questões totais (acumulado)",
-            "acerto_canonico_pct": "% acerto canônico",
+            "acerto_canonico_pct": "% acerto em simulados",
             "faixa": f"Faixa em {cur_mes_label}",
         },
         opacity=0.85,
@@ -2064,8 +2296,8 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
         prev_closed = months_closed[-2] if len(months_closed) >= 2 else None
         cur_per = aggregate_month(df, last_closed, cohort_df=cohort)
         st.info(
-            f"📊 **{label_grupo}** — {total:,} alunos. Mesma régua {PRESCRIPTION_VERSION} aplicada. "
-            f"Snapshot {snapshot_date_b2b:%d/%m %H:%M}."
+            f"📊 **{label_grupo}** — {total:,} alunos, avaliados com os mesmos "
+            f"critérios de faixa da turma B2C. Dados de {snapshot_date_b2b:%d/%m %H:%M}."
         )
         metrics_filtrado = metrics_acum_b2b[
             metrics_acum_b2b["account_id"].isin(ids_filtrados)
@@ -2080,17 +2312,24 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
         st.markdown("&nbsp;")
         st.markdown("##### Simulados institucionais ENAMED 2026")
         st.caption(
-            "Apenas mocks finalizados; aluno que fez 2 provas da mesma edição "
+            "Apenas simulados finalizados; aluno que fez 2 provas da mesma edição "
             "conta 1x (primeira tentativa). % ≥ 60 = alunos com 60%+ de acerto."
         )
         try:
             _enamed_ids = tuple(sorted(int(a) for a in cohort["account_id"].tolist()))
-            enamed_df = load_enamed_2026_results(_enamed_ids)
+            enamed_df = load_enamed_2026_results(
+                _enamed_ids,
+                release_id=ACTIVE_RELEASE_ID,
+            )
+            _edicoes_all = load_enamed_2026_templates(
+                release_id=ACTIVE_RELEASE_ID,
+            )
         except Exception as _e:
             st.error(f"Falha ao carregar ENAMED: {_e}")
             enamed_df = pd.DataFrame()
+            _edicoes_all = []
 
-        edicoes = [e for e in load_enamed_2026_templates()
+        edicoes = [e for e in _edicoes_all
                    if ies_filtro is None or e["ies"] == ies_filtro]
         if not edicoes:
             st.info(f"Nenhum simulado institucional mapeado para `{label_grupo}`.")
@@ -2162,8 +2401,9 @@ def _render_b2b_subtab(cohort_filtrado: pd.DataFrame, label_grupo: str, key_pref
 with tab_b2b:
     if not HAS_B2B:
         st.warning(
-            "Snapshot B2B não encontrado em `snapshots/b2b/latest*.parquet`. "
-            "Rode `etl/extract_b2b.py` para gerar."
+            B2B_LOAD_ERROR
+            or "Snapshot B2B não encontrado em `snapshots/b2b/latest*.parquet`. "
+               "Rode `etl/extract_b2b.py` para gerar."
         )
     elif not {"company_name", "ies_name"}.issubset(cohort_b2b.columns):
         st.warning(
@@ -2289,7 +2529,12 @@ def _filter_by_ids(cohort_ids: tuple[int, ...] | None):
 
 
 @st.cache_data(ttl=60 * 60)
-def faixa_por_mes(months: tuple[str, ...], cohort_ids: tuple[int, ...] | None = None) -> pd.DataFrame:
+def faixa_por_mes(
+    months: tuple[str, ...],
+    cohort_ids: tuple[int, ...] | None = None,
+    *,
+    release_id: str | None,
+) -> pd.DataFrame:
     """% da turma em cada faixa, mês a mês (linhas: mes; colunas: faixas)."""
     coh, df_local, _ = _filter_by_ids(cohort_ids)
     rows = []
@@ -2309,8 +2554,13 @@ def faixa_por_mes(months: tuple[str, ...], cohort_ids: tuple[int, ...] | None = 
 
 
 @st.cache_data(ttl=60 * 60)
-def acerto_canonico_mensal(months: tuple[str, ...], cohort_ids: tuple[int, ...] | None = None) -> pd.DataFrame:
-    """Mediana mensal de acerto canônico (entre alunos com mock canônico no mês)."""
+def acerto_canonico_mensal(
+    months: tuple[str, ...],
+    cohort_ids: tuple[int, ...] | None = None,
+    *,
+    release_id: str | None,
+) -> pd.DataFrame:
+    """Mediana mensal de acerto em simulados (entre alunos com simulado completo no mês)."""
     coh, df_local, _ = _filter_by_ids(cohort_ids)
     rows = []
     for mes in months:
@@ -2331,7 +2581,12 @@ def acerto_canonico_mensal(months: tuple[str, ...], cohort_ids: tuple[int, ...] 
 
 
 @st.cache_data(ttl=60 * 60)
-def safra_excelencia(ref_mes: str, cohort_ids: tuple[int, ...] | None = None) -> pd.DataFrame:
+def safra_excelencia(
+    ref_mes: str,
+    cohort_ids: tuple[int, ...] | None = None,
+    *,
+    release_id: str | None,
+) -> pd.DataFrame:
     """% em Excelência por mês de entrada (first_start_date)."""
     coh_base, df_local, _ = _filter_by_ids(cohort_ids)
     per = aggregate_month(df_local, ref_mes, cohort_df=coh_base)
@@ -2360,13 +2615,17 @@ Q1_SAFRAS = ("2026-01", "2026-02", "2026-03")
 
 
 @st.cache_data(ttl=60 * 60)
-def prescricao_vs_resultado_q1(ref_mes: str) -> tuple[pd.DataFrame, pd.DataFrame, int]:
-    """Matriz prescrição (volume) × resultado (faixa de acerto canônico).
+def prescricao_vs_resultado_q1(
+    ref_mes: str,
+    *,
+    release_id: str | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    """Matriz prescrição (volume) × resultado (faixa de acerto em simulados).
 
     Restrita aos alunos que entraram no Q1/26 (first_start_date em jan-mar/26).
     - Linhas = prescrição que o aluno está SEGUINDO, derivada do volume B+Q+F
       acumulado do mês de entrada até ref_mes vs target acumulado mensal.
-    - Colunas = faixa de acerto canônico no ref_mes (classe atual).
+    - Colunas = faixa de acerto em simulados no ref_mes (classe atual).
 
     Retorna (matrix_n, matrix_pct_row, total_alunos).
     """
@@ -2440,9 +2699,11 @@ def prescricao_vs_resultado_q1(ref_mes: str) -> tuple[pd.DataFrame, pd.DataFrame
 @st.cache_data(ttl=60 * 60)
 def lead_lag_prescricao_q1(
     months_closed_tuple: tuple[str, ...],
+    *,
+    release_id: str | None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, int, list[tuple[str, str]]]:
     """Lead-lag: prescrição volumétrica em mês N (target MENSAL) × faixa de
-    acerto canônico em mês N+2.
+    acerto em simulados em mês N+2.
 
     Restrito a alunos Q1/26. Pares (N, N+2) construídos pulando 1 mês entre
     prescrição e resultado. Em cada par, um aluno só participa se já estava
@@ -2529,7 +2790,7 @@ DOSE_RESPONSE_DIMS = [
     ("questoes",   "Questões"),
     ("flashcards", "Flashcards"),
     ("blocos",     "Blocos de aula"),
-    ("bqf",        "B+Q+F agregado"),
+    ("bqf",        "Aulas + questões + flashcards"),
 ]
 
 
@@ -2537,15 +2798,17 @@ DOSE_RESPONSE_DIMS = [
 def dose_response_obs_q1(
     months_closed_tuple: tuple[str, ...],
     condicionar_mock_n2: bool = True,
+    *,
+    release_id: str | None,
 ) -> pd.DataFrame:
-    """Observações pra dose-response: volume em N → acerto canônico em N+2.
+    """Observações pra dose-response: volume em N → acerto em simulados em N+2.
 
     Cada linha = (aluno, par N→N+2). Restrita a alunos Q1/26 já matriculados
-    em N. Por default condicionada a ter mock em N+2 (responde "entre quem fez
+    em N. Por default condicionada a ter simulado em N+2 (responde "entre quem fez
     mock, qual dose maximiza chance de Excel?"). Pares pulam 1 mês (N+2).
 
     Colunas retornadas: account_id, mes_n, mes_n2, questoes, flashcards, blocos,
-    bqf, pct_n2 (acerto canônico % em N+2), is_excel_n2 (vs canal recalibrado).
+    bqf, pct_n2 (acerto em simulados % em N+2), is_excel_n2 (vs canal recalibrado).
     """
     coh = cohort[["account_id", "first_start_date"]].copy()
     coh["first_start_date"] = pd.to_datetime(coh["first_start_date"])
@@ -2585,7 +2848,9 @@ def dose_response_obs_q1(
         return pd.DataFrame()
     obs = pd.concat(chunks, ignore_index=True)
     obs["excel_min_n2"] = obs["mes_n2"].map(lambda m: PRESCRIPTION_MONTHLY[m]["excel_min"])
-    obs["is_excel_n2"] = obs["pct_n2"] >= obs["excel_min_n2"]
+    obs["is_excel_n2"] = (
+        _stable_percentage(obs["pct_n2"]) >= obs["excel_min_n2"]
+    )
     if condicionar_mock_n2:
         obs = obs[obs["pct_n2"].notna()].reset_index(drop=True)
     return obs
@@ -2727,30 +2992,44 @@ with tab_evolucao:
         unsafe_allow_html=True,
     )
 
-    st.markdown("##### Distribuição da turma por faixa de desempenho, mês a mês")
+    st.markdown("##### Como a turma se distribui, mês a mês")
     st.caption(
-        'Faixas pela régua v2. Verde = Excelência; azul = Proficiência; '
-        '"Sem acerto canônico" = não fez simulado válido no mês. Mais verde = turma melhor.'
+        "Cada aluno cai numa faixa conforme o desempenho no simulado do mês: "
+        "verde = Excelência (no caminho de nota 75+ no ENAMED) · azul = "
+        "Proficiência (caminho de 60–74) · vermelho = abaixo disso · cinza = "
+        "não fez simulado no mês. Quanto mais verde, melhor."
     )
 
     meses_tuple = tuple(months_closed)
-    faixa_df = faixa_por_mes(meses_tuple, _evo_filter)
+    faixa_df = faixa_por_mes(
+        meses_tuple,
+        _evo_filter,
+        release_id=ACTIVE_RELEASE_ID,
+    )
     # Excelência fica na base pra a faixa que mais importa ser contínua e legível;
-    # Sem acerto canônico (sempre dominante) vai no topo, ocupando o espaço residual.
+    # Sem acerto em simulados (sempre dominante) vai no topo, ocupando o espaço residual.
     stack_order = ["Excelência", "Proficiência", "Abaixo do canal", "Sem acerto canônico"]
     pivot = faixa_df.pivot(index="mes_label", columns="faixa", values="pct").reindex(
         columns=stack_order
     )
     pivot = pivot.reindex([PRESCRIPTION_MONTHLY[m]["label"] for m in months_closed])
 
+    # Nomes internos das faixas → rótulos legíveis (só exibição; o dado não muda)
+    FAIXA_DISPLAY = {
+        "Excelência": "Excelência (caminho do 75+)",
+        "Proficiência": "Proficiência (caminho do 60–74)",
+        "Abaixo do canal": "Abaixo da meta",
+        "Sem acerto canônico": "Não fez simulado no mês",
+    }
     fig_area = go.Figure()
     for f in stack_order:
+        rotulo = FAIXA_DISPLAY.get(f, f)
         fig_area.add_trace(go.Scatter(
-            x=pivot.index, y=pivot[f], name=f,
+            x=pivot.index, y=pivot[f], name=rotulo,
             mode="lines", stackgroup="one", groupnorm="percent",
             line=dict(width=0.5, color=PRESCRIPTION_COLORS[f]),
             fillcolor=PRESCRIPTION_COLORS[f],
-            hovertemplate=f"<b>{f}</b><br>%{{y:.1f}}%<extra></extra>",
+            hovertemplate=f"<b>{rotulo}</b><br>%{{y:.1f}}%<extra></extra>",
         ))
     fig_area.update_layout(
         height=300, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
@@ -2762,16 +3041,21 @@ with tab_evolucao:
     )
     st.plotly_chart(fig_area, width="stretch")
 
-    # --- Bloco 2: acerto canônico mediano vs meta mensal v2 ---
+    # --- Bloco 2: acerto em simulados mediano vs meta mensal v2 ---
     st.markdown("&nbsp;")
-    st.markdown(f"##### % de acerto da turma vs. meta mensal da régua {PRESCRIPTION_VERSION}")
+    st.markdown("##### A turma está acertando o quanto deveria?")
     st.caption(
-        "Linha branca = mediana de acerto em simulados de quem fez simulado no mês "
-        "(n no rótulo). Faixas = intervalo-meta mensal: verde = Excelência, "
-        "azul = Proficiência."
+        "Linha branca = % de acerto típico (mediana) de quem fez simulado no mês; "
+        "o rótulo mostra quantos alunos fizeram. Faixa verde = onde precisa estar "
+        "quem busca nota 75+ no ENAMED; faixa azul = quem busca 60–74. As faixas "
+        "sobem mês a mês porque a exigência cresce ao longo do ano."
     )
 
-    ac_df = acerto_canonico_mensal(meses_tuple, _evo_filter)
+    ac_df = acerto_canonico_mensal(
+        meses_tuple,
+        _evo_filter,
+        release_id=ACTIVE_RELEASE_ID,
+    )
     fig_line = go.Figure()
     # Bandas (canais) — desenha cada uma como duas linhas com fill='tonexty'
     fig_line.add_trace(go.Scatter(
@@ -2782,9 +3066,9 @@ with tab_evolucao:
         x=ac_df["mes_label"], y=ac_df["excel_min"], mode="lines",
         line=dict(width=0, color="#6CE190"),
         fill="tonexty", fillcolor="rgba(5,252,137,.55)",
-        name=f"Canal Excelência {PRESCRIPTION_VERSION}",
+        name="Meta Excelência (nota 75+)",
         customdata=ac_df["excel_max"],
-        hovertemplate=f"Excelência {PRESCRIPTION_VERSION}: %{{y:.1f}}%–%{{customdata:.1f}}%<extra></extra>",
+        hovertemplate="Meta Excelência: %{y:.1f}%–%{customdata:.1f}%<extra></extra>",
     ))
     fig_line.add_trace(go.Scatter(
         x=ac_df["mes_label"], y=ac_df["prof_max"], mode="lines",
@@ -2794,16 +3078,16 @@ with tab_evolucao:
         x=ac_df["mes_label"], y=ac_df["prof_min"], mode="lines",
         line=dict(width=0, color="#50BCFF"),
         fill="tonexty", fillcolor="rgba(50,87,138,.50)",
-        name=f"Canal Proficiência {PRESCRIPTION_VERSION}",
+        name="Meta Proficiência (nota 60–74)",
         customdata=ac_df["prof_max"],
-        hovertemplate=f"Proficiência {PRESCRIPTION_VERSION}: %{{y:.1f}}%–%{{customdata:.1f}}%<extra></extra>",
+        hovertemplate="Meta Proficiência: %{y:.1f}%–%{customdata:.1f}%<extra></extra>",
     ))
     fig_line.add_trace(go.Scatter(
         x=ac_df["mes_label"], y=ac_df["mediana_turma"],
         mode="lines+markers+text",
         line=dict(color="#F8F8F8", width=3),
         marker=dict(size=9, color="#F8F8F8"),
-        name="Mediana turma R1 2026",
+        name="Turma (acerto típico)",
         text=[
             f"n={n}/{elegiveis}<br>({n/elegiveis*100:.0f}%)"
             if elegiveis else "n=0/0"
@@ -2812,14 +3096,14 @@ with tab_evolucao:
         textposition="top center",
         textfont=dict(size=10, color="#F8F8F8"),
         hovertemplate=(
-            "<b>Mediana turma</b>: %{y:.1f}%<br>"
+            "<b>Turma (acerto típico)</b>: %{y:.1f}%<br>"
             "%{text}<extra></extra>"
         ),
     ))
     fig_line.update_layout(
         height=340, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         margin=dict(l=10, r=10, t=10, b=10),
-        yaxis=dict(title="% acerto canônico", ticksuffix="%", range=[20, 90]),
+        yaxis=dict(title="% de acerto nos simulados", ticksuffix="%", range=[20, 90]),
         xaxis=dict(title="Mês"),
         legend=dict(orientation="h", yanchor="bottom", y=-0.25),
         hovermode="x unified",
@@ -2838,7 +3122,11 @@ with tab_evolucao:
         "Quem entrou antes teve mais tempo de curso — compare com cautela."
     )
 
-    safra_df = safra_excelencia(last_closed, _evo_filter)
+    safra_df = safra_excelencia(
+        last_closed,
+        _evo_filter,
+        release_id=ACTIVE_RELEASE_ID,
+    )
     if safra_df.empty:
         st.info("Sem dados para as turmas e meses selecionados.")
     else:
@@ -2849,19 +3137,19 @@ with tab_evolucao:
             name="% Excelência",
             text=[f"{p:.0f}%<br>n={t}" for p, t in zip(safra_df["pct_excelencia"], safra_df["total"])],
             textposition="outside",
-            hovertemplate="Safra %{x}<br>%{y:.1f}% em Excelência<br>%{text}<extra></extra>",
+            hovertemplate="Entrou em %{x}<br>%{y:.1f}% em Excelência<br>%{text}<extra></extra>",
         ))
         fig_safra.add_trace(go.Bar(
             x=safra_df["safra_label"], y=safra_df["pct_proficiencia"],
             marker_color=PRESCRIPTION_COLORS["Proficiência"],
             name="% Proficiência",
-            hovertemplate="Safra %{x}<br>%{y:.1f}% em Proficiência<extra></extra>",
+            hovertemplate="Entrou em %{x}<br>%{y:.1f}% em Proficiência<extra></extra>",
         ))
         fig_safra.update_layout(
             height=300, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             margin=dict(l=10, r=10, t=30, b=10),
             barmode="group",
-            yaxis=dict(title="% da safra", ticksuffix="%"),
+            yaxis=dict(title="% do grupo", ticksuffix="%"),
             xaxis=dict(title="Mês de entrada"),
             legend=dict(orientation="h", yanchor="bottom", y=-0.25),
         )
@@ -2870,14 +3158,15 @@ with tab_evolucao:
     # --- Bloco 3b: % atingindo meta de volume por mês de entrada ---
     st.markdown("&nbsp;")
     st.markdown(
-        f"##### % que atingiu a meta de volume de estudo acumulado, por mês de entrada "
-        f"— referência {PRESCRIPTION_MONTHLY[last_closed]['label']}"
+        f"##### Quem está estudando o volume recomendado? — por mês de entrada "
+        f"(até {PRESCRIPTION_MONTHLY[last_closed]['label']})"
     )
     st.caption(
-        "Volume = aulas assistidas + questões respondidas + flashcards revisados, "
-        "somados desde a entrada. Unidades diferentes — leia como aproximação; "
-        "não substitui a meta por atividade. Verde = atingiu a meta Excelência "
-        f"({EXCEL_VOLUME_PROFILE}); azul = entre as metas Proficiência e Excelência."
+        "Volume de estudo = aulas assistidas + questões respondidas + flashcards "
+        "revisados, somados desde a matrícula. Verde = já estuda o volume "
+        "recomendado para Excelência; azul = está entre o recomendado para "
+        "Proficiência e o de Excelência. Como soma atividades diferentes, leia "
+        "como aproximação."
     )
 
     vol_df = safra_volume(last_closed, _evo_filter)
@@ -2888,28 +3177,28 @@ with tab_evolucao:
         fig_vol.add_trace(go.Bar(
             x=vol_df["safra_label"], y=vol_df["pct_excel"],
             marker_color=PRESCRIPTION_COLORS["Excelência"],
-            name=f"% ≥ Excelência ({EXCEL_VOLUME_PROFILE})",
+            name="No volume de Excelência",
             text=[f"{p:.0f}%<br>n={t}" for p, t in zip(vol_df["pct_excel"], vol_df["total"])],
             textposition="outside",
             customdata=list(zip(vol_df["total"], vol_df["target_excel"], vol_df["mediana_bqf"])),
             hovertemplate=(
-                "Safra %{x}<br>"
-                f"%{{y:.1f}}% ≥ target Excelência ({EXCEL_VOLUME_PROFILE})<br>"
-                "Target Excelência acum: %{customdata[1]:,.0f}<br>"
-                "Mediana B+Q+F acum: %{customdata[2]:,.0f}<br>"
+                "Entrou em %{x}<br>"
+                "%{y:.1f}% no volume de Excelência<br>"
+                "Volume recomendado (acum.): %{customdata[1]:,.0f}<br>"
+                "Volume típico do grupo (acum.): %{customdata[2]:,.0f}<br>"
                 "n=%{customdata[0]}<extra></extra>"
             ),
         ))
         fig_vol.add_trace(go.Bar(
             x=vol_df["safra_label"], y=vol_df["pct_prof"],
             marker_color=PRESCRIPTION_COLORS["Proficiência"],
-            name="% entre Proficiência e Excelência",
+            name="Entre Proficiência e Excelência",
             customdata=list(zip(vol_df["total"], vol_df["target_prof"], vol_df["mediana_bqf"])),
             hovertemplate=(
-                "Safra %{x}<br>"
+                "Entrou em %{x}<br>"
                 "%{y:.1f}% entre Proficiência e Excelência<br>"
-                "Target Proficiência acum: %{customdata[1]:,.0f}<br>"
-                "Mediana B+Q+F acum: %{customdata[2]:,.0f}<br>"
+                "Volume recomendado (acum.): %{customdata[1]:,.0f}<br>"
+                "Volume típico do grupo (acum.): %{customdata[2]:,.0f}<br>"
                 "n=%{customdata[0]}<extra></extra>"
             ),
         ))
@@ -2917,7 +3206,7 @@ with tab_evolucao:
             height=300, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             margin=dict(l=10, r=10, t=30, b=10),
             barmode="group",
-            yaxis=dict(title="% da safra", ticksuffix="%"),
+            yaxis=dict(title="% do grupo", ticksuffix="%"),
             xaxis=dict(title="Mês de entrada"),
             legend=dict(orientation="h", yanchor="bottom", y=-0.25),
         )
@@ -2927,15 +3216,16 @@ with tab_evolucao:
     st.markdown("&nbsp;")
     st.markdown("##### Métricas semanais avançadas")
     st.caption(
-        f"Excelência = alunos na faixa Excelência em {cur_mes_label}. Turma toda = "
-        "todas as matrículas ativas. Volumes contam os zeros de quem não estudou "
-        "(denominador = todos os pagantes, regra 2026-07-19). % de acerto: só quem "
-        "respondeu na semana."
+        f'Aba "Excelência" = só os alunos que estão na faixa Excelência em '
+        f'{cur_mes_label}; "Turma toda" = todas as matrículas ativas. Nos volumes, '
+        "quem não estudou conta como zero — a média considera todos os alunos "
+        "pagantes, não só quem usou a plataforma. No % de acerto entra só quem "
+        "respondeu questões na semana."
     )
 
     # Métricas: nome → (coluna no df, tipo de cálculo)
     # tipo: 'vol' = soma por aluno-semana → agg sobre alunos ativos
-    #       'ratio_can' = acerto canônico % = ac_acertos / ac_qcount
+    #       'ratio_can' = acerto em simulados % = ac_acertos / ac_qcount
     #       'ratio_simp' = acerto simples % = acertos_simples / respostas_simples
     METRICAS_AV = {
         "Blocos de aula":             ("blocos",       "vol"),
@@ -2944,7 +3234,7 @@ with tab_evolucao:
         "Simulados canônicos":        ("sim_template", "vol"),
         "Simulados revisão":          ("sim_revision", "vol"),
         "Simulados fixação":          ("sim_fixation", "vol"),
-        "% acerto canônico":          (None,           "ratio_can"),
+        "% acerto em simulados":          (None,           "ratio_can"),
         "% acerto simples":           (None,           "ratio_simp"),
     }
 
@@ -3055,10 +3345,22 @@ with tab_qualidade:
 
     _acc_ids = tuple(sorted(int(a) for a in cohort["account_id"].tolist()))
     try:
-        aulas = load_avaliacoes_aulas(_acc_ids)
-        questoes = load_avaliacoes_questoes(_acc_ids)
-        materiais = load_avaliacoes_materiais(_acc_ids)
-        flashcards = load_avaliacoes_flashcards(_acc_ids)
+        aulas = load_avaliacoes_aulas(
+            _acc_ids,
+            release_id=ACTIVE_RELEASE_ID,
+        )
+        questoes = load_avaliacoes_questoes(
+            _acc_ids,
+            release_id=ACTIVE_RELEASE_ID,
+        )
+        materiais = load_avaliacoes_materiais(
+            _acc_ids,
+            release_id=ACTIVE_RELEASE_ID,
+        )
+        flashcards = load_avaliacoes_flashcards(
+            _acc_ids,
+            release_id=ACTIVE_RELEASE_ID,
+        )
     except Exception as e:
         st.error(f"Falha ao carregar avaliações: {e}")
         st.stop()
@@ -3334,31 +3636,69 @@ with tab_qualidade:
 
 # ============================================================
 # ABA VOZ DO ALUNO — feedback espontâneo, sem IA
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _voz_frames(*, release_id: str | None):
+    """Feedbacks normalizados + recortes, cacheados por release.
+
+    Sem cache, a normalização de ~54k linhas (datas, fillna, regex) rodava
+    em toda interação de qualquer aba.
+    """
+    feedbacks = load_feedbacks_organicos(release_id=release_id)
+    if feedbacks.empty:
+        vazio = pd.DataFrame()
+        return feedbacks, vazio, vazio, vazio
+    feedbacks = feedbacks.copy()
+    # created_at vem do Aurora em UTC (TimeZone=UTC, verificado 2026-07-26);
+    # exibição e janela "Críticos agora" (30d) são em BRT.
+    feedbacks["data"] = (
+        pd.to_datetime(feedbacks["data"], errors="coerce")
+        .dt.tz_localize("UTC")
+        .dt.tz_convert("America/Sao_Paulo")
+        .dt.tz_localize(None)
+    )
+    feedbacks = feedbacks.dropna(subset=["data"])
+    feedbacks["mes"] = feedbacks["data"].dt.to_period("M").astype(str)
+    for coluna in (
+        "segmento",
+        "origem",
+        "classificacao",
+        "conteudo_tipo",
+        "conteudo",
+        "professor",
+        "status",
+    ):
+        feedbacks[coluna] = feedbacks[coluna].fillna("Não informado").astype(str)
+    feedbacks["texto"] = (
+        feedbacks["texto"]
+        .fillna("")
+        .astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    avaliacoes = _feedbacks_com_nota_valida(feedbacks)
+    sem_nota = _feedbacks_sem_nota(feedbacks)
+    falas = feedbacks[
+        feedbacks["tem_texto"].eq(True)
+        & feedbacks["texto"].ne("")
+    ].copy()
+    return feedbacks, avaliacoes, sem_nota, falas
 # ============================================================
 
 with tab_voz:
     st.markdown("##### Voz do aluno")
     st.caption(
-        "Feedbacks espontâneos de aulas, explicações de questões, "
-        "materiais e flashcards. Reportes de erro de flashcards não têm nota e "
-        "são tratados no fluxo de correção de conteúdo, fora desta aba."
+        "Falas espontâneas enviadas na plataforma, comentários de avaliações "
+        "e reportes de conteúdo — cada tipo tratado com a sua própria semântica."
     )
-    st.info(
-        "Feedback espontâneo tem viés de autoseleção: responde quem decide avaliar, "
-        "muitas vezes após experiências muito boas ou ruins. Os percentuais descrevem "
-        "os registros recebidos, não representam todos os alunos."
-    )
-    st.warning(
-        "Uso interno. A sanitização automática remove identificadores comuns, mas "
-        "texto livre ainda pode conter nomes ou outros dados pessoais digitados pelo aluno."
-    )
-
     try:
-        feedbacks = load_feedbacks_organicos()
-        feedbacks = _feedbacks_com_nota_valida(feedbacks)
+        feedbacks, avaliacoes, sem_nota, falas = _voz_frames(
+            release_id=ACTIVE_RELEASE_ID,
+        )
     except Exception as e:
         st.error(f"Falha ao carregar feedbacks: {e}")
-        feedbacks = pd.DataFrame()
+        feedbacks = avaliacoes = sem_nota = falas = pd.DataFrame()
 
     if feedbacks.empty:
         st.info(
@@ -3366,18 +3706,20 @@ with tab_voz:
             "por mais de um dia, verificar o ETL."
         )
     else:
-        feedbacks = feedbacks.copy()
-        feedbacks["data"] = pd.to_datetime(feedbacks["data"], errors="coerce")
-        feedbacks = feedbacks.dropna(subset=["data"])
-        feedbacks["mes"] = feedbacks["data"].dt.to_period("M").astype(str)
+        st.markdown("###### Panorama das avaliações")
+        r_avaliacoes, r_sem_nota, r_falas, r_alunos = st.columns(4)
+        r_avaliacoes.metric("Avaliações com nota", f"{len(avaliacoes):,}")
+        r_sem_nota.metric("Registros sem nota", f"{len(sem_nota):,}")
+        r_falas.metric("Falas aprovadas", f"{len(falas):,}")
+        r_alunos.metric(
+            "Alunos que responderam",
+            f"{feedbacks['aluno_hash'].replace('', pd.NA).nunique():,}",
+        )
 
-        for coluna in ("segmento", "origem", "classificacao"):
-            feedbacks[coluna] = feedbacks[coluna].fillna("Não informado").astype(str)
-
-        segmentos = sorted(feedbacks["segmento"].unique())
-        origens = sorted(feedbacks["origem"].unique())
+        segmentos = sorted(avaliacoes["segmento"].unique())
+        origens = sorted(avaliacoes["origem"].unique())
         notas_opcoes = ["1", "2", "3", "4", "5"]
-        meses = sorted(feedbacks["mes"].unique(), reverse=True)
+        meses = sorted(avaliacoes["mes"].unique(), reverse=True)
 
         f_segmento, f_origem, f_nota, f_mes = st.columns(4)
         with f_segmento:
@@ -3403,24 +3745,27 @@ with tab_voz:
                 key="voz_mes",
             )
 
-        base_kpi = feedbacks[
-            feedbacks["segmento"].isin(segmentos_sel)
-            & feedbacks["origem"].isin(origens_sel)
+        base_kpi = avaliacoes[
+            avaliacoes["segmento"].isin(segmentos_sel)
+            & avaliacoes["origem"].isin(origens_sel)
         ].copy()
         if mes_sel is not None:
             base_kpi = base_kpi[base_kpi["mes"] == mes_sel]
         notas_selecionadas = [int(nota) for nota in notas_sel]
         filtrados = base_kpi[base_kpi["nota"].isin(notas_selecionadas)].copy()
 
-        tem_texto = filtrados["tem_texto"].fillna(False).astype(bool)
+        tem_texto = filtrados["tem_texto"].eq(True)
         registros = len(filtrados)
-        comentarios = int(tem_texto.sum())
+        comentarios_aprovados = int(tem_texto.sum())
         alunos = int(filtrados["aluno_hash"].nunique())
         pct_criticos = _feedback_critical_pct(base_kpi)
 
         k_registros, k_comentarios, k_alunos, k_criticos = st.columns(4)
         k_registros.metric("Registros", f"{registros:,}")
-        k_comentarios.metric("Comentários", f"{comentarios:,}")
+        k_comentarios.metric(
+            "Comentários aprovados",
+            f"{comentarios_aprovados:,}",
+        )
         k_alunos.metric("Alunos com feedback", f"{alunos:,}")
         k_criticos.metric(
             "% críticos nas notas",
@@ -3434,42 +3779,42 @@ with tab_voz:
 
         graf_notas, graf_mensal = st.columns([1, 2])
         with graf_mensal:
-            st.markdown("###### Comentários por mês e origem")
-            comentarios_df = filtrados[tem_texto].copy()
-            if comentarios_df.empty:
+            st.markdown("###### Avaliações por mês e origem")
+            registros_df = filtrados.copy()
+            if registros_df.empty:
                 st.info(
-                    "Sem comentários neste recorte. Amplie os filtros de segmento, "
+                    "Sem avaliações neste recorte. Amplie os filtros de segmento, "
                     "origem, nota ou mês."
                 )
             else:
-                comentarios_df["mes_data"] = (
-                    comentarios_df["data"].dt.to_period("M").dt.to_timestamp()
+                registros_df["mes_data"] = (
+                    registros_df["data"].dt.to_period("M").dt.to_timestamp()
                 )
-                serie_comentarios = (
-                    comentarios_df.groupby(["mes_data", "origem"])
+                serie_registros = (
+                    registros_df.groupby(["mes_data", "origem"])
                     .size()
-                    .rename("comentarios")
+                    .rename("registros")
                     .reset_index()
                 )
-                fig_comentarios = px.bar(
-                    serie_comentarios,
+                fig_registros = px.bar(
+                    serie_registros,
                     x="mes_data",
-                    y="comentarios",
+                    y="registros",
                     color="origem",
                     labels={
                         "mes_data": "Mês",
-                        "comentarios": "Comentários",
+                        "registros": "Avaliações",
                         "origem": "Origem",
                     },
                 )
-                fig_comentarios.update_layout(
+                fig_registros.update_layout(
                     height=360,
                     barmode="stack",
                     margin=dict(l=10, r=10, t=10, b=10),
                     xaxis=dict(tickformat="%b/%y"),
                     legend=dict(orientation="h", yanchor="bottom", y=-0.3),
                 )
-                st.plotly_chart(fig_comentarios, width="stretch")
+                st.plotly_chart(fig_registros, width="stretch")
 
         with graf_notas:
             st.markdown("###### Distribuição das notas")
@@ -3504,70 +3849,114 @@ with tab_voz:
                 )
                 st.plotly_chart(fig_notas, width="stretch")
 
-        st.markdown("###### Feedbacks recentes")
-        busca = st.text_input(
-            "Buscar no texto, conteúdo, professor ou origem",
-            placeholder="Digite um termo…",
-            key="voz_busca",
-        ).strip()
-
-        feed = filtrados[tem_texto].copy()
-        feed["texto"] = (
-            feed["texto"].fillna("").astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
-        )
-        if "conteudo_id" not in feed.columns:
-            feed["conteudo_id"] = pd.NA
-        feed["conteudo_id"] = feed["conteudo_id"].replace("", pd.NA).fillna("—")
-        if busca:
-            colunas_busca = ["texto", "conteudo", "professor", "origem"]
-            haystack = (
-                feed[colunas_busca]
-                .fillna("")
-                .astype(str)
-                .agg(" ".join, axis=1)
+        st.markdown("###### Comentários das avaliações")
+        comentarios = filtrados[filtrados["tem_texto"].eq(True)].copy()
+        if comentarios.empty:
+            st.info(
+                "Sem comentários neste recorte. Amplie os filtros de segmento, "
+                "origem, nota ou mês."
             )
-            feed = feed[haystack.str.contains(busca, case=False, regex=False)]
-
-        feed = feed.sort_values("data", ascending=False).head(500)
-        if feed.empty:
-            st.info("Nenhum comentário encontrado.")
         else:
-            feed_publico = feed[
-                [
-                    "data",
-                    "segmento",
-                    "origem",
-                    "nota",
-                    "texto",
-                    "conteudo",
-                    "conteudo_id",
-                    "professor",
+            busca_coment = st.text_input(
+                "Buscar no comentário, conteúdo ou professor",
+                placeholder="Digite um termo…",
+                key="voz_busca_comentarios",
+            ).strip()
+            if busca_coment:
+                alvo = (
+                    comentarios[["texto", "conteudo", "professor"]]
+                    .fillna("")
+                    .astype(str)
+                    .agg(" ".join, axis=1)
+                )
+                comentarios = comentarios[
+                    alvo.str.contains(busca_coment, case=False, regex=False)
                 ]
-            ].rename(
-                columns={
-                    "data": "Data",
-                    "segmento": "Segmento",
-                    "origem": "Origem",
-                    "nota": "Nota",
-                    "texto": "Feedback",
-                    "conteudo": "Conteúdo",
-                    "conteudo_id": "ID",
-                    "professor": "Professor",
-                }
-            )
+            comentarios = comentarios.sort_values("data", ascending=False).head(500)
             st.dataframe(
-                feed_publico,
+                comentarios[
+                    ["data", "segmento", "origem", "nota", "texto", "conteudo", "professor"]
+                ].rename(
+                    columns={
+                        "data": "Data",
+                        "segmento": "Segmento",
+                        "origem": "Origem",
+                        "nota": "Nota",
+                        "texto": "Comentário",
+                        "conteudo": "Conteúdo",
+                        "professor": "Professor",
+                    }
+                ),
                 hide_index=True,
                 width="stretch",
                 column_config={
                     "Data": st.column_config.DatetimeColumn(format="DD/MM/YYYY"),
-                    "Feedback": st.column_config.TextColumn(width="large"),
+                    "Comentário": st.column_config.TextColumn(width="large"),
                     "Conteúdo": st.column_config.TextColumn(width="medium"),
                 },
             )
             st.caption(
-                f"{len(feed_publico):,} comentário(s) exibido(s), limitados aos "
-                "500 mais recentes. Textos sanitizados no ETL e exibidos sem HTML. "
-                "Para flashcards, a nota se refere ao baralho (deck), não a uma carta "
-                "individual — o ID exibido é o ID do deck."
+                f"{len(comentarios):,} comentário(s), limitados aos 500 mais "
+                "recentes. Textos sanitizados automaticamente e exibidos sem HTML."
             )
+
+        st.markdown("###### Tema do feedback espontâneo")
+        falas_esp = falas[falas["origem"].eq("Feedback espontâneo")]
+        contagem_temas = falas_esp["conteudo"].value_counts()
+        if not contagem_temas.empty:
+            st.caption(
+                f"{int(contagem_temas.sum()):,} fala(s) aprovada(s) em "
+                f"{len(contagem_temas)} categoria(s). Escolha um tema para "
+                "filtrar as falas abaixo."
+            )
+            fig_temas = px.bar(
+                x=contagem_temas.values,
+                y=contagem_temas.index,
+                orientation="h",
+                labels={"x": "Falas aprovadas", "y": "Categoria"},
+                color_discrete_sequence=[EMR["approved"]],
+            )
+            fig_temas.update_layout(
+                height=max(160, 30 * len(contagem_temas) + 40),
+                margin=dict(l=10, r=10, t=10, b=10),
+                showlegend=False,
+                yaxis=dict(categoryorder="total ascending"),
+            )
+            st.plotly_chart(fig_temas, width="stretch")
+        temas = sorted(falas_esp["conteudo"].dropna().unique())
+        tema_fala = st.selectbox(
+            "Tema do feedback espontâneo",
+            [None, *temas],
+            format_func=lambda tema: "Todos os temas" if tema is None else tema,
+            key="voz_tema_espontaneo",
+            label_visibility="collapsed",
+        )
+
+        st.markdown("###### O que os alunos estão dizendo")
+        falas_destaque = _filter_feedbacks_by_theme(falas_esp, tema_fala)
+        falas_destaque = falas_destaque.sort_values(
+            "data",
+            ascending=False,
+        ).head(6)
+        if falas_destaque.empty:
+            st.info(
+                "Nenhuma fala aprovada neste recorte. Notas e volumes estruturados "
+                "continuam disponíveis acima."
+            )
+        else:
+            for _, fala in falas_destaque.iterrows():
+                with st.container(border=True):
+                    nota = pd.to_numeric(fala["nota"], errors="coerce")
+                    nota_label = (
+                        "Sem nota"
+                        if pd.isna(nota)
+                        else f"Nota {int(nota)}/5"
+                    )
+                    st.caption(
+                        f"{fala['data']:%d/%m/%Y} · {fala['origem']} · "
+                        f"{nota_label} · {fala['segmento']}"
+                    )
+                    # st.text: texto de aluno não é Markdown — "# x" viraria
+                    # heading e "[y](mailto:…)" viraria link clicável.
+                    st.text(fala["texto"])
+                    st.caption(f"Tema: {fala['conteudo']}")
